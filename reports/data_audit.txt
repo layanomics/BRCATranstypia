@@ -1,0 +1,51 @@
+RAW FILES
+- Expression: TCGA-BRCA.HiSeqV2.gz | shape=(20530, 1219) | md5=3ea92ab7e8fcb6102ddca52a44d45002
+- Phenotype:  TCGA-BRCA.GDC_phenotype.tsv | shape=(1247, 194) | md5=2192a1772da7df9e9599d005d3a0a483
+
+EXPRESSION
+- First column (gene id): sample
+- First few sample columns: TCGA-AR-A5QQ-01, TCGA-D8-A1JA-01, TCGA-BH-A0BQ-01, TCGA-BH-A0BT-01, TCGA-A8-A06X-01
+- Example barcode16 from expression: TCGA-AR-A5QQ-01, TCGA-D8-A1JA-01, TCGA-BH-A0BQ-01, TCGA-BH-A0BT-01, TCGA-A8-A06X-01
+
+PHENOTYPE
+- Candidate sample ID columns: sampleID, _INTEGRATION, _PATIENT, bcr_followup_barcode, bcr_patient_barcode, bcr_sample_barcode, pathology_report_file_name, _GENOMIC_ID_TCGA_BRCA_RPPA_RBN, _GENOMIC_ID_TCGA_BRCA_mutation, _GENOMIC_ID_TCGA_BRCA_PDMRNAseq, _GENOMIC_ID_TCGA_BRCA_hMethyl450, _GENOMIC_ID_TCGA_BRCA_PDMRNAseqCNV, _GENOMIC_ID_TCGA_BRCA_mutation_curated_wustl_gene, _GENOMIC_ID_TCGA_BRCA_hMethyl27, _GENOMIC_ID_TCGA_BRCA_PDMarrayCNV, _GENOMIC_ID_TCGA_BRCA_miRNA_HiSeq, _GENOMIC_ID_TCGA_BRCA_mutation_wustl_gene, _GENOMIC_ID_TCGA_BRCA_miRNA_GA, _GENOMIC_ID_data/public/TCGA/BRCA/miRNA_GA_gene, _GENOMIC_ID_TCGA_BRCA_gistic2thd, _GENOMIC_ID_data/public/TCGA/BRCA/miRNA_HiSeq_gene, _GENOMIC_ID_TCGA_BRCA_G4502A_07_3, _GENOMIC_ID_TCGA_BRCA_gistic2, _GENOMIC_ID_TCGA_BRCA_PDMarray
+- Candidate subtype columns:  Integrated_Clusters_with_PAM50__nature2012, PAM50Call_RNAseq, PAM50_mRNA_nature2012
+- Chosen sample-ID column: bcr_sample_barcode
+- Chosen subtype column:   Integrated_Clusters_with_PAM50__nature2012
+- Example barcode16 from phenotype (bcr_sample_barcode): TCGA-3C-AAAU-01A, TCGA-3C-AALI-01A, TCGA-3C-AALK-01A, TCGA-4H-AAAK-01A, TCGA-5L-AAT0-01A, TCGA-5L-AAT1-01A
+
+SAMPLE TYPE COUNTS
+sample_type
+01    932
+11    117
+06      5
+
+SUBTYPE VALUE COUNTS (top 10 each)
+
+[Integrated_Clusters_with_PAM50__nature2012]
+Integrated_Clusters_with_PAM50__nature2012
+NaN    899
+3      161
+4       76
+2       72
+1       39
+
+[PAM50Call_RNAseq]
+PAM50Call_RNAseq
+LumA      434
+NaN       291
+LumB      194
+Basal     142
+Normal    119
+Her2       67
+
+[PAM50_mRNA_nature2012]
+PAM50_mRNA_nature2012
+NaN              725
+Luminal A        231
+Luminal B        127
+Basal-like        98
+HER2-enriched     58
+Normal-like        8
+
+NOTE: The first column in the expression file is named 'sample' but contains gene IDs (to be renamed in preprocessing).

@@ -1,0 +1,11 @@
+# src/configs/data.yaml
+outdir: data/raw
+
+sources:
+  expression:
+    filename: TCGA-BRCA.star_fpkm-uq.tsv
+    url: https://gdc-hub.s3.us-east-1.amazonaws.com/download/TCGA-BRCA.star_fpkm-uq.tsv.gz
+  phenotype:
+    filename: TCGA-BRCA.phenotype.tsv
+    url: https://gdc-hub.s3.us-east-1.amazonaws.com/download/TCGA-BRCA.clinical.tsv.gz
+
