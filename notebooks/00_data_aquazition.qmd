@@ -1,0 +1,103 @@
+---
+title: "Data Acquisition"
+author: "BRCATranstypia Team"
+date: "`r format(Sys.Date(), '%Y-%m-%d')`"
+format:
+  html:
+    toc: true
+    toc-depth: 3
+---
+
+```{r}
+#| label: setup
+#| include: false
+# Load required libraries
+suppressPackageStartupMessages({
+  library(tidyverse)
+  library(UCSCXenaTools)
+})
+```
+
+## Project Overview
+
+This notebook documents the process used to collect the datasets that power the BRCATranstypia project. It outlines the source systems, extraction approaches, and validation steps that ensure the raw data is reliable before it moves further along the pipeline.
+
+## Data Sources
+
+- **TCGA-BRCA phenotype**: Patient-level clinical annotations made available through the UCSC Xena data hub.
+- **TCGA-BRCA expression**: Normalized RNA-Seq expression measurements from the same source, enabling paired clinical and molecular analyses.
+- **Reference tables**: Internal lookup tables used to harmonize identifiers and controlled vocabularies.
+
+## Acquisition Workflow
+
+1. Identify the datasets of interest on the UCSC Xena hubs.
+2. Query and download the phenotype and expression matrices.
+3. Persist the raw files to the `/data/raw` directory for downstream processing.
+4. Record metadata about the pull for reproducibility.
+
+## Discover TCGA-BRCA Datasets on UCSC Xena
+
+```{r}
+#| label: discover-xena-datasets
+# Inspect available BRCA datasets from the TCGA hub.
+brca_index <- XenaData %>%
+  filter(XenaHostNames == "tcgaHub",
+         str_detect(XenaDatasets, "TCGA\\.BRCA")) %>%
+  select(XenaDatasets, Label, DataSubtype)
+
+head(brca_index)
+```
+
+The discovery step surfaces the phenotype and gene-expression datasets that will be pulled in the following sections.
+
+## Download TCGA-BRCA Phenotype Data
+
+```{r}
+#| label: download-phenotype
+# Define the dataset that contains clinical annotations.
+phenotype_dataset <- XenaData %>%
+  filter(XenaHostNames == "tcgaHub",
+         XenaDatasets == "TCGA.BRCA.sampleMap/BRCA_clinicalMatrix")
+
+# Generate a download plan and execute it.
+phenotype_plan <- phenotype_dataset %>%
+  XenaGenerate(download_dir = file.path("data", "raw", "xena")) %>%
+  XenaQuery()
+
+phenotype_files <- XenaDownload(phenotype_plan, download = TRUE)
+
+# Prepare the phenotype matrix as a tidy tibble for inspection.
+phenotype_tbl <- XenaPrepare(phenotype_files)
+
+dplyr::glimpse(phenotype_tbl)
+```
+
+The raw TSV file and its metadata are now available in `data/raw/xena` for reuse across notebooks and pipelines.
+
+## Download TCGA-BRCA Gene Expression Data
+
+```{r}
+#| label: download-expression
+# Select the RNA-Seq gene expression dataset mapped to genes (HiSeqV2).
+expression_dataset <- XenaData %>%
+  filter(XenaHostNames == "tcgaHub",
+         XenaDatasets == "TCGA.BRCA.sampleMap/HiSeqV2")
+
+expression_plan <- expression_dataset %>%
+  XenaGenerate(download_dir = file.path("data", "raw", "xena")) %>%
+  XenaQuery()
+
+expression_files <- XenaDownload(expression_plan, download = TRUE)
+
+expression_tbl <- XenaPrepare(expression_files)
+
+expression_tbl[1:5, 1:6]
+```
+
+This workflow retrieves the TCGA-BRCA RNA-Seq expression matrix, which can be joined with the phenotype data by the sample identifiers. Subsequent notebooks can focus on cleaning, harmonizing, and transforming these assets for modeling and visualization.
+
+## Next Steps
+
+- Validate file integrity (checksums, row and gene counts).
+- Log acquisition metadata, including hub version and download timestamps.
+- Transition the dataset into the preprocessing pipeline for quality control and feature engineering.
