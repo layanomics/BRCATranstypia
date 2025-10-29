@@ -1,4 +1,4 @@
-# app.py — exact model features (versioned ENSG), offline ID mapping, stable session
+# app.py — unified demo for multi-panel BRCA subtype prediction
 from pathlib import Path
 import json, io, re
 import numpy as np
@@ -7,9 +7,9 @@ import streamlit as st
 import joblib
 
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
-st.title("🧬 BRCATranstypia — BRCA Subtype Prediction")
+st.title("🧬 BRCATranstypia — BRCA Subtype Predictor")
 
-# ---------- locate files ----------
+# ---------- locate project root ----------
 def find_root(start: Path) -> Path:
     p = start.resolve()
     for _ in range(8):
@@ -21,70 +21,73 @@ def find_root(start: Path) -> Path:
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 
-MODEL_PATH   = ROOT / "models" / "model.joblib"
-FEATURES_TXT = ROOT / "models" / "features.txt"
-CLASSES_JSON = ROOT / "models" / "classes.json"
-ID_MAP_PATH  = ROOT / "models" / "id_map.csv"
+# ---------- define model bundles ----------
+BIG = {
+    "model": ROOT / "models" / "model.joblib",
+    "feats": ROOT / "models" / "features.txt",
+    "classes": ROOT / "models" / "classes.json",
+    "stats": ROOT / "models" / "feature_stats.npz",
+    "name": "full-60k"
+}
+SMALL = {
+    "model": ROOT / "models" / "model_panel5k.joblib",
+    "feats": ROOT / "models" / "features_panel5k.txt",
+    "classes": ROOT / "models" / "classes_panel5k.json",
+    "stats": ROOT / "models" / "feature_stats_panel5k.npz",
+    "name": "panel-5k"
+}
+ID_MAP_PATH = ROOT / "models" / "id_map.csv"
 
-# ---------- load model & metadata ----------
+# ---------- load models ----------
 @st.cache_resource
-def load_assets():
-    model = joblib.load(MODEL_PATH)
-    # features.txt is now just a fallback; we prefer model.feature_names_in_
-    features = [ln.strip() for ln in FEATURES_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
-    classes = json.loads(CLASSES_JSON.read_text()) if CLASSES_JSON.exists() else list(getattr(model, "classes_", []))
+def load_bundle(bundle):
+    model = joblib.load(bundle["model"])
+    feats = [ln.strip() for ln in Path(bundle["feats"]).read_text(encoding="utf-8").splitlines() if ln.strip()]
+    if Path(bundle["classes"]).exists():
+        classes = json.loads(Path(bundle["classes"]).read_text())
+    else:
+        classes = list(getattr(model, "classes_", []))
+    mu = sd = feats_stats = None
+    if Path(bundle["stats"]).exists():
+        z = np.load(bundle["stats"])
+        mu, sd, feats_stats = z["mean"], z["std"], list(z["features"])
+    return model, feats, classes, mu, sd, feats_stats
 
-    # offline map (must exist in repo)
-    id_map = pd.read_csv(ID_MAP_PATH)
-    id_map.columns = [c.lower() for c in id_map.columns]
-    id_map["ensembl"] = id_map["ensembl"].astype(str).str.upper().str.replace(r"\.\d+$", "", regex=True)
-    id_map["symbol"]  = id_map["symbol"].astype(str).str.upper()
-    sym2ens = dict(zip(id_map["symbol"],  id_map["ensembl"]))   # SYMBOL  -> ENSG (unversioned)
-    ens2sym = dict(zip(id_map["ensembl"], id_map["symbol"]))    # ENSG(unv)-> SYMBOL
-    return model, features, classes, sym2ens, ens2sym
+model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG = load_bundle(BIG)
+model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL = load_bundle(SMALL)
 
-model, FEATURES_RAW_FALLBACK, CLASSES, SYM2ENS, ENS2SYM = load_assets()
+# ---------- load ID map ----------
+id_map = pd.read_csv(ID_MAP_PATH)
+id_map.columns = [c.lower() for c in id_map.columns]
+id_map["ensembl"] = id_map["ensembl"].astype(str).str.upper().str.replace(r"\.\d+$", "", regex=True)
+id_map["symbol"] = id_map["symbol"].astype(str).str.upper()
+SYM2ENS = dict(zip(id_map["symbol"], id_map["ensembl"]))
+ENS2SYM = dict(zip(id_map["ensembl"], id_map["symbol"]))
 
 # ---------- helpers ----------
-ENSEMBL_RE = re.compile(r"^ENSG\d+(\.\d+)?$", re.I)
+ENSEMBL_RE = re.compile(r"^ENSG\d+", re.I)
 
 def norm_gene(x: str) -> str:
     s = str(x).strip().split("|", 1)[0].replace("_", "-").upper()
-    return s.split(".")[0] if s.startswith("ENSG") else s
+    if s.startswith("ENSG"):
+        s = s.split(".")[0]
+    return s
 
-# Use the model’s EXACT training column names (includes ENSG versions)
-MODEL_FEATS_EXACT = list(getattr(model, "feature_names_in_", FEATURES_RAW_FALLBACK))
-if not MODEL_FEATS_EXACT:
-    st.error("Model is missing feature names. Refit with a pandas DataFrame to capture column names.")
-    st.stop()
-
-# Build an unversioned->exact map so we can upgrade ENSG→ENSG.version
-UNVER_TO_EXACT = {}
-for f in MODEL_FEATS_EXACT:
-    UNVER_TO_EXACT.setdefault(norm_gene(f), f)  # keep first occurrence
-
-def detect_id_system(names) -> str:
-    names = [str(x).upper() for x in names]
-    ens = sum(1 for x in names[:500] if ENSEMBL_RE.match(x))
-    return "ENSEMBL" if ens >= max(5, int(0.3 * max(1, len(names[:500])))) else "SYMBOL"
-
-def parse_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
-    b1 = io.BytesIO(raw_bytes); b2 = io.BytesIO(raw_bytes)
-    # matrix / gene-rows
+def parse_any_table(upload) -> pd.DataFrame:
+    raw = upload.getvalue()
+    b1 = io.BytesIO(raw); b2 = io.BytesIO(raw)
     try:
         df = pd.read_csv(b1)
         if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
             return df
     except Exception:
         pass
-    # two-column gene,value
     try:
-        df2 = pd.read_csv(io.BytesIO(raw_bytes), header=None, names=["gene", "value"])
+        df2 = pd.read_csv(io.BytesIO(raw), header=None, names=["gene", "value"])
         if df2.shape[1] == 2 and df2["gene"].astype(str).str.len().gt(0).any():
             return pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist(), index=["sample_1"])
     except Exception:
         pass
-    # single comma-separated line
     try:
         txt = b2.getvalue().decode("utf-8").strip()
         if "," in txt and "\n" not in txt and txt.count(",") > 10:
@@ -93,110 +96,82 @@ def parse_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
             return pd.DataFrame([vals], columns=cols, index=["sample_1"])
     except Exception:
         pass
-    raise ValueError("Unrecognized file format.")
+    raise ValueError("Unrecognized file format. Please upload a CSV (samples×genes) or a simple vector.")
 
-def to_model_exact(df: pd.DataFrame) -> tuple[pd.DataFrame, int]:
-    """Map uploaded table to model's EXACT feature names & order. Returns (X, overlap_exact)."""
-    # 1) normalize header to uppercase, strip ENSG versions for matching
-    df = df.copy()
-    df.columns = pd.Index([norm_gene(c) for c in df.columns])
-
-    # 2) if symbols, map to unversioned ENSG first
-    uploaded_ids = detect_id_system(df.columns)
-    if uploaded_ids == "SYMBOL":
-        df.columns = pd.Index([SYM2ENS.get(c, c) for c in df.columns])
-
-    # 3) upgrade unversioned ENSG -> model's exact version (if known)
-    exact_cols = []
-    for c in df.columns:
-        if str(c).upper().startswith("ENSG"):
-            exact_cols.append(UNVER_TO_EXACT.get(norm_gene(c), c))
-        else:
-            exact_cols.append(c)
-    df.columns = pd.Index(exact_cols)
-
-    # 4) if gene-rows, pivot to samples×genes
+def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFrame:
     if df.columns[0].lower() in {"gene", "genes", "symbol", "gene_symbol"}:
         df = df.set_index(df.columns[0]).T
+    out = df.copy()
+    for f in features_norm:
+        if f not in out.columns:
+            out[f] = np.nan
+    out = out[features_norm].apply(pd.to_numeric, errors="coerce").fillna(0.0)
+    return out
 
-    # 5) exact-overlap and vectorized alignment
-    overlap = len(set(df.columns) & set(MODEL_FEATS_EXACT))
-    missing = [f for f in MODEL_FEATS_EXACT if f not in df.columns]
-    if missing:
-        filler = pd.DataFrame(0.0, index=df.index, columns=missing)
-        df = pd.concat([df, filler], axis=1)
+def choose_model(upload_cols: list[str]) -> tuple:
+    ov_small = len(set(upload_cols) & set(FEATS_SMALL))
+    ov_big = len(set(upload_cols) & set(FEATS_BIG))
+    pct_small = ov_small / max(1, len(FEATS_SMALL)) * 100
+    pct_big = ov_big / max(1, len(FEATS_BIG)) * 100
 
-    X = df[MODEL_FEATS_EXACT].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    return X, overlap
+    if ov_small >= ov_big or pct_small >= 60:
+        st.sidebar.success(f"Using compact panel-5k model ({ov_small}/{len(FEATS_SMALL)} overlap)")
+        return "panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL
+    else:
+        st.sidebar.info(f"Using full-60k model ({ov_big}/{len(FEATS_BIG)} overlap)")
+        return "full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG
 
-# ---------- stable session state ----------
-if "df" not in st.session_state:
-    st.session_state.df = None
-if "filename" not in st.session_state:
-    st.session_state.filename = None
-
+# ---------- UI ----------
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
-    st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
-
+    st.caption("Columns = genes, rows = samples. If your file has genes as rows, it will auto-pivot.")
     up = st.file_uploader("Choose a CSV file", type=["csv"])
     if up is not None:
         try:
-            df0 = parse_from_bytes(up.getvalue())
-            st.session_state.df = df0
-            st.session_state.filename = up.name
-        except Exception as e:
-            st.exception(e)
-
-    c1, c2, _ = st.columns([1,1,6])
-    with c1:
-        if st.button("🔄 Clear"):
-            st.session_state.df = None
-            st.session_state.filename = None
-
-    if st.session_state.df is None:
-        st.info("⬆️ Upload a CSV file to start.")
-    else:
-        try:
-            raw = st.session_state.df.copy()
-            st.write(f"File: **{st.session_state.filename or 'uploaded.csv'}**")
+            raw = parse_any_table(up)
             st.write("Detected shape:", tuple(raw.shape))
 
-            # Align to model's EXACT features (handles SYMBOL/ENSEMBL + versions)
-            X, overlap_exact = to_model_exact(raw)
-            st.write(f"Exact-feature overlap: {overlap_exact} / {len(MODEL_FEATS_EXACT)}")
-            st.write("Aligned shape (samples × training features):", tuple(X.shape))
-            st.dataframe(X.iloc[:5, :25], use_container_width=True)
+            raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
+            model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = choose_model(list(raw.columns))
+            overlap = len(set(raw.columns) & set(FEATS))
+            X = align_to_features(raw, FEATS)
 
-            proba = model.predict_proba(X)
+            # normalization
+            if MU is not None and FSTATS is not None:
+                Xv = (X.values - MU) / SD
+            else:
+                mu_local = X.mean(axis=0).values
+                sd_local = X.std(axis=0).values
+                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
+                Xv = (X.values - mu_local) / sd_local
+
+            proba = mdl.predict_proba(Xv)
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
-            preds = pd.DataFrame(proba, columns=cols, index=X.index if X.index.is_unique else range(len(X)))
-
+            preds = pd.DataFrame(proba, columns=cols, index=X.index)
+            conf = preds.max(axis=1)
+            st.caption(f"Model: {model_name} • Overlap: {overlap}/{len(FEATS)} ({overlap/len(FEATS)*100:.1f}%) • Mean confidence: {conf.mean():.2f}")
             st.subheader("Predicted probabilities")
-            st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
+            st.dataframe(preds.style.format({c:"{:.3f}" for c in cols}), use_container_width=True)
 
             top = preds.idxmax(axis=1).rename("predicted_subtype")
-            out = pd.concat([top, preds], axis=1)
-            st.download_button(
-                "📥 Download predictions (CSV)",
-                out.to_csv(index=True).encode("utf-8"),
-                file_name="predictions.csv",
-                mime="text/csv"
-            )
-            st.success("✅ Prediction complete")
+            out = pd.concat([top, conf.rename("confidence"), preds], axis=1)
+            csv_bytes = out.to_csv(index=True).encode("utf-8")
+            st.download_button("📥 Download predictions (CSV)", data=csv_bytes,
+                               file_name=f"predictions_{model_name}.csv",
+                               mime="text/csv", key="dl_preds_main")
 
+            if overlap/len(FEATS) < 0.6:
+                st.warning("⚠️ Feature overlap below 60 %. Predictions may be unreliable.")
         except Exception as e:
             st.exception(e)
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
-    st.caption("Line 1: comma-separated gene names. Line 2: comma-separated values.")
-
-    # small previews using model features
-    head_preview = ",".join([f for f in MODEL_FEATS_EXACT[:25]])
-    vals_preview = ",".join(["0"] * 25)
+    st.caption("Line 1: comma-separated gene names.  Line 2: comma-separated values.")
+    head_preview = ",".join(FEATS_SMALL[:25]) + ("..." if len(FEATS_SMALL) > 25 else "")
+    vals_preview = ",".join(["0"] * min(25, len(FEATS_SMALL))) + ("..." if len(FEATS_SMALL) > 25 else "")
     txt = st.text_area("Paste here", value=head_preview + "\n" + vals_preview, height=140)
 
     if st.button("Predict (pasted)"):
@@ -204,23 +179,31 @@ with tab2:
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
             if len(lines) < 2:
                 raise ValueError("Provide two lines: header then values.")
-            genes = [g.strip() for g in lines[0].split(",")]
-            vals  = [float(x.strip()) for x in lines[1].split(",")]
+            genes = [norm_gene(g) for g in lines[0].split(",")]
+            vals = [float(x.strip()) for x in lines[1].split(",")]
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
+            model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = choose_model(list(df.columns))
+            overlap = len(set(df.columns) & set(FEATS))
+            X = align_to_features(df, FEATS)
 
-            X, overlap_exact = to_model_exact(df)
-            st.write(f"Exact-feature overlap: {overlap_exact} / {len(MODEL_FEATS_EXACT)}")
-            st.write("Aligned shape:", tuple(X.shape))
+            if MU is not None and FSTATS is not None:
+                Xv = (X.values - MU) / SD
+            else:
+                mu_local = X.mean(axis=0).values
+                sd_local = X.std(axis=0).values
+                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
+                Xv = (X.values - mu_local) / sd_local
 
-            proba = model.predict_proba(X)
+            proba = mdl.predict_proba(Xv)
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols, index=["sample_1"])
-
+            conf = preds.max(axis=1).iloc[0]
+            st.caption(f"Model: {model_name} • Overlap: {overlap}/{len(FEATS)} ({overlap/len(FEATS)*100:.1f}%) • Confidence: {conf:.2f}")
             st.subheader("Predicted probabilities")
             st.dataframe(preds.style.format({c:"{:.3f}" for c in cols}), use_container_width=True)
-            st.success("✅ Done")
         except Exception as e:
             st.exception(e)
 
 st.divider()
-st.caption("Model & app © BRCATranstypia • Educational demo")
+st.caption("Model & app © BRCATranstypia • Educational research prototype")
+
