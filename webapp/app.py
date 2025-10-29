@@ -1,7 +1,6 @@
-# app.py — robust loader (matrix, gene-rows, single vector) + real predictions
+# app.py — robust loader + auto-predict
 from pathlib import Path
-import json
-import io
+import json, io
 
 import numpy as np
 import pandas as pd
@@ -37,20 +36,19 @@ def load_assets():
 try:
     model, FEATURES, CLASSES = load_assets()
     st.sidebar.success(f"Model loaded • {len(FEATURES)} features")
+    st.sidebar.write("Model path:", MODEL_PATH)
     st.sidebar.caption(f"App file: {__file__}")
 except Exception as e:
-    st.error(f"Failed to load model: {e}")
+    st.error(f"Failed to load model or metadata: {e}")
     st.stop()
 
 # ---------- helpers ----------
-def align_to_features(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
-    """Ensure df is samples × genes with the training feature order."""
-    # If first column looks like a gene column → pivot
+def align_to_features(df: pd.DataFrame, features) -> pd.DataFrame:
+    """Normalize to samples×genes and reorder to training feature list."""
     first = df.columns[0].lower()
     if first in {"gene", "genes", "symbol", "gene_symbol"}:
-        df = df.set_index(df.columns[0]).T
+        df = df.set_index(df.columns[0]).T  # genes-as-rows -> pivot
 
-    # Coerce numerics and add missing features
     out = df.copy()
     for f in features:
         if f not in out.columns:
@@ -60,61 +58,47 @@ def align_to_features(df: pd.DataFrame, features: list[str]) -> pd.DataFrame:
 
 def parse_any_table(upload) -> pd.DataFrame:
     """
-    Accepts:
-      1) samples × genes CSV (header = genes)
-      2) genes × samples CSV (first col = gene/gene_symbol)
-      3) single-row vector with header genes
-      4) two-column vector: gene,value
-      5) single-cell with comma-separated values
-    Returns a DataFrame (samples × genes). Raises ValueError if not parsable.
+    Accept any of: samples×genes; genes×samples (first col=gene); one-row vector with header;
+    two-column gene,value; or single comma-separated line of values.
     """
     raw_bytes = upload.read()
-    # Keep a copy for multi-pass reads
-    buf1 = io.BytesIO(raw_bytes)
-    buf2 = io.BytesIO(raw_bytes)
+    buf_a = io.BytesIO(raw_bytes)
+    buf_b = io.BytesIO(raw_bytes)
 
-    # Try normal CSV
+    # Try normal CSV (matrix or gene-rows)
     try:
-        df = pd.read_csv(buf1)
+        df = pd.read_csv(buf_a)
+        if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
+            return df
     except Exception:
-        df = None
+        pass
 
-    if df is not None and df.shape[1] >= 2:
-        # Case A: matrix (samples × genes) or gene-rows (genes × samples)
-        return df
-
-    # Case B: two-column vector gene,value
+    # Try two-column gene,value
     try:
         df2 = pd.read_csv(io.BytesIO(raw_bytes), header=None, names=["gene", "value"])
         if df2.shape[1] == 2 and df2["gene"].astype(str).str.isalpha().any():
-            # Make a 1-row matrix
-            mat = pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist())
-            mat.index = ["sample_1"]
+            mat = pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist(), index=["sample_1"])
             return mat
     except Exception:
         pass
 
-    # Case C: one cell of comma-separated numbers
+    # Try single comma-separated line
     try:
-        txt = buf2.getvalue().decode("utf-8").strip()
-        # If it looks like "v1, v2, v3"
+        txt = buf_b.getvalue().decode("utf-8").strip()
         if "," in txt and "\n" not in txt and txt.count(",") > 10:
             vals = [float(x.strip()) for x in txt.split(",")]
-            # if length matches features, build a single-row df with correct header
             if len(vals) == len(FEATURES):
-                mat = pd.DataFrame([vals], columns=FEATURES, index=["sample_1"])
-                return mat
-            else:
-                # fallback: create generic columns; align_to_features will handle later
-                cols = [f"g{i}" for i in range(len(vals))]
-                mat = pd.DataFrame([vals], columns=cols, index=["sample_1"])
-                return mat
+                return pd.DataFrame([vals], columns=FEATURES, index=["sample_1"])
+            cols = [f"g{i}" for i in range(len(vals))]
+            return pd.DataFrame([vals], columns=cols, index=["sample_1"])
     except Exception:
         pass
 
-    raise ValueError("Could not parse the uploaded file. Please upload a CSV of samples×genes, "
-                     "a genes×samples table (with a 'gene' column), a single-row vector with gene header, "
-                     "or a two-column file 'gene,value'.")
+    raise ValueError(
+        "Could not parse the uploaded file. Upload a CSV of samples×genes, a genes×samples table "
+        "(with a 'gene' column), a single-row vector with gene header, a two-column 'gene,value' file, "
+        "or a single comma-separated line."
+    )
 
 # ---------- UI ----------
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
@@ -123,23 +107,42 @@ with tab1:
     st.subheader("Upload CSV (samples × genes)")
     st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
     up = st.file_uploader("Choose a CSV file", type=["csv"])
+
     if up is not None:
         try:
             raw = parse_any_table(up)
-            st.write("Detected shape:", raw.shape)
+            st.write("Detected shape:", tuple(raw.shape))
+
+            overlap = len(set(raw.columns) & set(FEATURES))
+            st.write(f"Feature overlap with training: {overlap} / {len(FEATURES)}")
+
             X = align_to_features(raw, FEATURES)
-            st.write("Aligned shape:", X.shape)
+            st.write("Aligned shape (samples × training features):", tuple(X.shape))
             st.dataframe(X.head(), use_container_width=True)
-            if st.button("Predict", type="primary"):
-                proba = model.predict_proba(X)
-                preds = pd.DataFrame(proba, columns=CLASSES if len(CLASSES) else range(proba.shape[1]),
-                                     index=X.index if X.index.is_unique else range(len(X)))
-                st.subheader("Predicted probabilities")
-                st.dataframe(preds.style.format({c:"{:.3f}" for c in preds.columns}), use_container_width=True)
-                st.success("Done ✅")
-                st.stop()
+
+            # AUTO-PREDICT
+            proba = model.predict_proba(X)
+            preds = pd.DataFrame(
+                proba,
+                columns=CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])],
+                index=X.index if X.index.is_unique else range(len(X)),
+            )
+
+            st.subheader("Predicted probabilities")
+            st.dataframe(preds.style.format({c: "{:.3f}" for c in preds.columns}), use_container_width=True)
+
+            top = preds.idxmax(axis=1).rename("predicted_subtype")
+            out = pd.concat([top, preds], axis=1)
+            st.download_button(
+                "📥 Download predictions (CSV)",
+                out.to_csv(index=True).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv",
+            )
+            st.success("Done ✅")
+            st.stop()  # prevent rerun from re-showing upload block
         except Exception as e:
-            st.error(f"Upload/parse failed: {e}")
+            st.error(f"Upload/parse/predict failed: {e}")
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
@@ -158,14 +161,19 @@ with tab2:
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES)
             proba = model.predict_proba(X)
-            preds = pd.DataFrame(proba, columns=CLASSES if len(CLASSES) else range(proba.shape[1]), index=["sample_1"])
+            preds = pd.DataFrame(
+                proba,
+                columns=CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])],
+                index=["sample_1"],
+            )
             st.subheader("Predicted probabilities")
-            st.dataframe(preds.style.format({c:"{:.3f}" for c in preds.columns}), use_container_width=True)
+            st.dataframe(preds.style.format({c: "{:.3f}" for c in preds.columns}), use_container_width=True)
             st.success("Done ✅")
         except Exception as e:
             st.error(str(e))
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
+
 
 
