@@ -1,26 +1,15 @@
-# app.py — robust upload + auto ID mapping + immediate prediction + stable reruns
+# app.py — offline gene ID mapping + robust upload + immediate prediction
 from pathlib import Path
-import json, io, re, sys, subprocess
-
+import json, io, re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
 
-# --- ensure mygene available (needed for auto mapping) ---
-try:
-    import mygene  # type: ignore
-except Exception:
-    try:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "mygene", "--quiet"])
-        import mygene  # type: ignore
-    except Exception:
-        mygene = None
-
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 st.title("🧬 BRCATranstypia — BRCA Subtype Prediction")
 
-# ---------- locate & load ----------
+# ---------- locate files ----------
 def find_root(start: Path) -> Path:
     p = start.resolve()
     for _ in range(8):
@@ -29,108 +18,81 @@ def find_root(start: Path) -> Path:
         p = p.parent
     return start
 
-ROOT = find_root(Path(__file__).resolve().parents[1])
+THIS = Path(__file__).resolve()
+ROOT = find_root(THIS.parent)
 MODEL_PATH   = ROOT / "models" / "model.joblib"
 FEATURES_TXT = ROOT / "models" / "features.txt"
 CLASSES_JSON = ROOT / "models" / "classes.json"
+ID_MAP_PATH  = ROOT / "models" / "id_map.csv"   # <-- offline map built once
 
+# ---------- load model & metadata ----------
 @st.cache_resource
 def load_assets():
     model = joblib.load(MODEL_PATH)
     features = [ln.strip() for ln in FEATURES_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
     classes = json.loads(CLASSES_JSON.read_text()) if CLASSES_JSON.exists() else list(getattr(model, "classes_", []))
-    return model, features, classes
+    # load offline map
+    id_map = pd.read_csv(ID_MAP_PATH)
+    id_map.columns = [c.lower() for c in id_map.columns]
+    id_map["ensembl"] = id_map["ensembl"].astype(str).str.upper().str.replace(r"\.\d+$", "", regex=True)
+    id_map["symbol"]  = id_map["symbol"].astype(str).str.upper()
+    sym2ens = dict(zip(id_map["symbol"],  id_map["ensembl"]))
+    ens2sym = dict(zip(id_map["ensembl"], id_map["symbol"]))
+    return model, features, classes, sym2ens, ens2sym
 
 try:
-    model, FEATURES_RAW, CLASSES = load_assets()
+    model, FEATURES_RAW, CLASSES, SYM2ENS, ENS2SYM = load_assets()
     st.sidebar.success(f"Model loaded • {len(FEATURES_RAW)} features")
     st.sidebar.write("Model path:", MODEL_PATH)
 except Exception as e:
     st.exception(e); st.stop()
 
-# ---------- gene ID utilities ----------
+# ---------- helpers ----------
 ENSEMBL_RE = re.compile(r"^ENSG\d+(\.\d+)?$", re.I)
 
-def norm_gene(name: str) -> str:
-    s = str(name).strip()
-    s = s.split("|", 1)[0]             # drop aliases after '|'
-    if s.upper().startswith("ENSG"):
-        s = re.sub(r"\.\d+$", "", s)   # strip version
-    s = s.replace("_", "-")
-    return s.upper()
+def norm_gene(x: str) -> str:
+    s = str(x).strip().split("|", 1)[0].replace("_", "-").upper()
+    if s.startswith("ENSG"):
+        s = s.split(".")[0]
+    return s
 
 @st.cache_resource
 def normalized_features():
     return [norm_gene(g) for g in FEATURES_RAW]
-
 FEATURES_NORM = normalized_features()
 
 def detect_id_system(names) -> str:
-    names = list(names)[:500]
-    ens = sum(1 for x in names if ENSEMBL_RE.match(str(x).strip()))
-    return "ensembl" if ens >= max(5, int(0.3 * max(1, len(names)))) else "symbol"
+    names = [str(x) for x in names]
+    ens = sum(1 for x in names[:500] if ENSEMBL_RE.match(x))
+    return "ENSEMBL" if ens >= max(5, int(0.3 * max(1, len(names[:500])))) else "SYMBOL"
 
-@st.cache_resource(show_spinner=False)
-def mg_client():
-    if mygene is None:
-        raise RuntimeError("The 'mygene' package is required. Add 'mygene' to requirements.txt.")
-    return mygene.MyGeneInfo()
+def auto_map_cols(cols: pd.Index, model_ids: str, uploaded_ids: str) -> pd.Index:
+    out = []
+    for c in cols:
+        n = norm_gene(c)
+        if model_ids == "ENSEMBL" and uploaded_ids == "SYMBOL":
+            out.append(SYM2ENS.get(n, n))
+        elif model_ids == "SYMBOL" and uploaded_ids == "ENSEMBL":
+            out.append(ENS2SYM.get(n, n))
+        else:
+            out.append(n)
+    return pd.Index(out)
 
-def map_ids(names: pd.Index, source: str, target: str) -> pd.Index:
-    if source == target:
-        return pd.Index([norm_gene(x) for x in names])
-    mg = mg_client()
-    q = [norm_gene(x) for x in names]
-    if source == "symbol" and target == "ensembl":
-        res = mg.querymany(q, scopes="symbol", fields="ensembl.gene",
-                           species="human", as_dataframe=True, returnall=False, verbose=False)
-        mapped = []
-        for k in q:
-            try:
-                v = res.loc[k, "ensembl.gene"]
-                if isinstance(v, (list, tuple)): v = v[0]
-                mapped.append(norm_gene(v) if pd.notna(v) else k)
-            except Exception:
-                mapped.append(k)
-        return pd.Index(mapped)
-    if source == "ensembl" and target == "symbol":
-        res = mg.querymany(q, scopes="ensembl.gene", fields="symbol",
-                           species="human", as_dataframe=True, returnall=False, verbose=False)
-        mapped = []
-        for k in q:
-            try:
-                v = res.loc[k, "symbol"]
-                if isinstance(v, (list, tuple)): v = v[0]
-                mapped.append(norm_gene(v) if pd.notna(v) else k)
-            except Exception:
-                mapped.append(k)
-        return pd.Index(mapped)
-    return pd.Index([norm_gene(x) for x in names])
-
-# ---------- parsing & alignment ----------
 def parse_any_table(upload) -> pd.DataFrame:
-    """Accept matrix, gene-rows, one-row vector (header), two-column gene,value, or comma list."""
-    # IMPORTANT: use getvalue() so reruns keep the same bytes
-    raw_bytes = upload.getvalue()
-    b1 = io.BytesIO(raw_bytes); b2 = io.BytesIO(raw_bytes)
-
-    # Matrix / gene-rows
+    raw = upload.getvalue()
+    b1 = io.BytesIO(raw); b2 = io.BytesIO(raw)
     try:
         df = pd.read_csv(b1)
         if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
             return df
     except Exception:
         pass
-
-    # Two-column gene,value
     try:
-        df2 = pd.read_csv(io.BytesIO(raw_bytes), header=None, names=["gene", "value"])
+        df2 = pd.read_csv(io.BytesIO(raw), header=None, names=["gene", "value"])
         if df2.shape[1] == 2 and df2["gene"].astype(str).str.len().gt(0).any():
             return pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist(), index=["sample_1"])
     except Exception:
         pass
-
-    # Single comma-separated line
     try:
         txt = b2.getvalue().decode("utf-8").strip()
         if "," in txt and "\n" not in txt and txt.count(",") > 10:
@@ -139,12 +101,10 @@ def parse_any_table(upload) -> pd.DataFrame:
             return pd.DataFrame([vals], columns=cols, index=["sample_1"])
     except Exception:
         pass
-
     raise ValueError("Unrecognized file format.")
 
 def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFrame:
-    first = df.columns[0].lower()
-    if first in {"gene", "genes", "symbol", "gene_symbol"}:
+    if df.columns[0].lower() in {"gene", "genes", "symbol", "gene_symbol"}:
         df = df.set_index(df.columns[0]).T
     out = df.copy()
     for f in features_norm:
@@ -166,30 +126,23 @@ with tab1:
             raw = parse_any_table(up)
             st.write("Detected shape:", tuple(raw.shape))
 
-            # normalize incoming header
             raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
-
-            # detect & auto-map if IDs differ
-            model_ids   = detect_id_system(FEATURES_NORM)
-            uploaded_ids= detect_id_system(raw.columns)
+            model_ids    = detect_id_system(FEATURES_NORM)
+            uploaded_ids = detect_id_system(raw.columns)
             st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
 
             if model_ids != uploaded_ids:
-                if mygene is None:
-                    st.error("Auto-mapping requires 'mygene' in requirements.txt"); st.stop()
-                raw.columns = map_ids(raw.columns, uploaded_ids, model_ids)
-                st.info("Applied automatic gene ID mapping (via mygene).")
+                raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
+                st.info("Applied automatic gene ID mapping (offline).")
 
             overlap = len(set(raw.columns) & set(FEATURES_NORM))
             st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
-
             if overlap < 50:
                 st.error("Too few overlapping genes to predict confidently (need ≥ 50).")
-                st.write("First 20 columns in your file (normalized):", list(raw.columns[:20]))
+                st.write("First 20 columns (normalized):", list(raw.columns[:20]))
                 st.write("First 20 model features:", FEATURES_NORM[:20])
                 st.stop()
 
-            # align → predict → stop (so the page doesn't jump back)
             X = align_to_features(raw, FEATURES_NORM)
             st.write("Aligned shape (samples × training features):", tuple(X.shape))
             st.dataframe(X.head(), use_container_width=True)
@@ -226,15 +179,10 @@ with tab2:
             if len(lines) < 2: raise ValueError("Provide two lines: header then values.")
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals  = [float(x.strip()) for x in lines[1].split(",")]
-
             # map pasted header if needed
             model_ids = detect_id_system(FEATURES_NORM)
             pasted_ids= detect_id_system(genes)
-            if model_ids != pasted_ids:
-                if mygene is None:
-                    st.error("Auto-mapping requires 'mygene' in requirements.txt"); st.stop()
-                genes = list(map_ids(pd.Index(genes), pasted_ids, model_ids))
-
+            genes = list(auto_map_cols(pd.Index(genes), model_ids, pasted_ids))
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES_NORM)
             proba = model.predict_proba(X)
@@ -248,6 +196,8 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
+
+
 
 
 
