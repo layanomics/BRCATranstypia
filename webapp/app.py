@@ -1,11 +1,21 @@
-# app.py — robust loader + gene name normalization + optional mapping
+# app.py — robust loader + auto gene ID mapping (symbols ⇄ Ensembl)
 from pathlib import Path
-import json, io, re
+import json, io, re, sys, subprocess
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
+
+# --------- optional auto-install for mygene (helpful on Cloud) ----------
+try:
+    import mygene  # type: ignore
+except Exception:
+    try:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "mygene"])
+        import mygene  # type: ignore
+    except Exception as _e:
+        mygene = None  # we'll error nicely later
 
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 st.title("🧬 BRCATranstypia — BRCA Subtype Prediction")
@@ -41,12 +51,13 @@ except Exception as e:
     st.error(f"Failed to load model or metadata: {e}")
     st.stop()
 
-# ---------- gene-name normalization & optional mapping ----------
+# ---------- gene-name normalization ----------
+ENSEMBL_RE = re.compile(r"^ENSG\d+(\.\d+)?$", re.I)
 def norm_gene(name: str) -> str:
-    """Uppercase, strip whitespace, drop alias after '|', remove .version suffix."""
     s = str(name).strip()
-    s = s.split("|", 1)[0]             # e.g., "TP53|1234" -> "TP53"
-    s = re.sub(r"\.?\d+$", "", s) if s.upper().startswith("ENSG") else s  # strip ensembl version
+    s = s.split("|", 1)[0]            # drop alias after '|'
+    if s.upper().startswith("ENSG"):
+        s = re.sub(r"\.\d+$", "", s)  # strip version
     s = s.replace("_", "-")
     return s.upper()
 
@@ -56,13 +67,56 @@ def normalized_features():
 
 FEATURES_NORM = normalized_features()
 
-def apply_mapping(cols: pd.Index, mapping_df: pd.DataFrame | None):
-    """Map column names using optional 'from','to' mapping CSV."""
-    if mapping_df is None:
-        return cols
-    mp = dict(zip(mapping_df["from"].astype(str).map(norm_gene),
-                  mapping_df["to"].astype(str).map(norm_gene)))
-    return pd.Index([mp.get(norm_gene(c), norm_gene(c)) for c in cols])
+def detect_id_system(names: pd.Index | list[str]) -> str:
+    n = 0
+    for x in list(names)[:500]:
+        if ENSEMBL_RE.match(str(x).strip()):
+            n += 1
+    # if many look like Ensembl => ensembl, else symbols
+    return "ensembl" if n >= max(5, int(0.3 * min(500, len(names)))) else "symbol"
+
+# ---------- mapping via mygene ----------
+@st.cache_resource(show_spinner=False)
+def build_mygene_client():
+    if mygene is None:
+        raise RuntimeError("The 'mygene' package is required. Add 'mygene' to requirements.txt.")
+    return mygene.MyGeneInfo()
+
+def map_ids(names: pd.Index, source: str, target: str) -> pd.Index:
+    """Map symbols⇄ensembl using mygene (human). Returns new index with mapped IDs (normalized)."""
+    if source == target:
+        return pd.Index([norm_gene(x) for x in names])
+
+    mg = build_mygene_client()
+    q = [norm_gene(x) for x in names]
+    # mygene scopes/fields
+    if source == "symbol" and target == "ensembl":
+        res = mg.querymany(q, scopes="symbol", fields="ensembl.gene", species="human", as_dataframe=True, returnall=False, verbose=False)
+        # res index is query; 'ensembl.gene' can be list or str
+        mapped = []
+        for k in q:
+            try:
+                v = res.loc[k, "ensembl.gene"]
+                if isinstance(v, (list, tuple)):
+                    v = v[0]
+                mapped.append(norm_gene(v) if pd.notna(v) else k)
+            except Exception:
+                mapped.append(k)
+        return pd.Index(mapped)
+    if source == "ensembl" and target == "symbol":
+        res = mg.querymany(q, scopes="ensembl.gene", fields="symbol", species="human", as_dataframe=True, returnall=False, verbose=False)
+        mapped = []
+        for k in q:
+            try:
+                v = res.loc[k, "symbol"]
+                if isinstance(v, (list, tuple)):
+                    v = v[0]
+                mapped.append(norm_gene(v) if pd.notna(v) else k)
+            except Exception:
+                mapped.append(k)
+        return pd.Index(mapped)
+    # fallback (shouldn't happen)
+    return pd.Index([norm_gene(x) for x in names])
 
 # ---------- helpers ----------
 def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFrame:
@@ -72,7 +126,6 @@ def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFram
     if first in {"gene", "genes", "symbol", "gene_symbol"}:
         df = df.set_index(df.columns[0]).T
 
-    # numeric coercion later; just ensure all columns exist
     out = df.copy()
     for f in features_norm:
         if f not in out.columns:
@@ -81,7 +134,7 @@ def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFram
     return out
 
 def parse_any_table(upload) -> pd.DataFrame:
-    """Accept matrix, gene-rows, 1-row vector (header), two-column gene,value, or comma list."""
+    """Accept matrix, gene-rows, one-row vector (header), two-column gene,value, or comma list."""
     raw_bytes = upload.read()
     b1 = io.BytesIO(raw_bytes); b2 = io.BytesIO(raw_bytes)
 
@@ -119,46 +172,43 @@ tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
     st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
+    up = st.file_uploader("Choose a CSV file", type=["csv"])
 
-    # Optional mapping upload
-    map_up = st.file_uploader("Optional gene mapping CSV (columns: from,to)", type=["csv"], key="map")
-    mapping_df = None
-    if map_up is not None:
-        try:
-            mapping_df = pd.read_csv(map_up)
-            assert {"from","to"}.issubset({c.lower() for c in mapping_df.columns})
-            # normalize headers exactly 'from','to'
-            mapping_df.columns = [c.lower() for c in mapping_df.columns]
-            st.info(f"Loaded mapping with {len(mapping_df)} rows.")
-        except Exception as e:
-            st.error(f"Could not read mapping: {e}")
-            mapping_df = None
-
-    up = st.file_uploader("Choose a CSV file", type=["csv"], key="data")
     if up is not None:
         try:
             raw = parse_any_table(up)
             st.write("Detected shape:", tuple(raw.shape))
 
-            # Normalize incoming column names + apply optional mapping
-            norm_cols = apply_mapping(raw.columns, mapping_df)
-            norm_cols = pd.Index([norm_gene(c) for c in norm_cols])
-            raw.columns = norm_cols
+            # Normalize incoming column names
+            raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
 
-            # Diagnostics
+            # Detect ID systems
+            model_id_type = detect_id_system(pd.Index(FEATURES_NORM))
+            incoming_id_type = detect_id_system(raw.columns)
+            st.write(f"Model IDs: **{model_id_type}**, Uploaded IDs: **{incoming_id_type}**")
+
+            # Auto-map if mismatch
+            if model_id_type != incoming_id_type:
+                if mygene is None:
+                    st.error("Auto-mapping requires the 'mygene' package. Add 'mygene' to requirements.txt.")
+                    st.stop()
+                mapped_cols = map_ids(raw.columns, source=incoming_id_type, target=model_id_type)
+                before_set = set(raw.columns)
+                raw.columns = mapped_cols
+                st.info("Applied automatic gene ID mapping (via mygene).")
+
+            # Overlap diagnostics
             overlap = len(set(raw.columns) & set(FEATURES_NORM))
             st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
-
             if overlap == 0:
-                st.error(
-                    "No overlapping genes after normalization. "
-                    "Your file likely uses a different ID system (e.g., HGNC symbols vs Ensembl IDs). "
-                    "Upload a mapping CSV (columns: from,to) or retrain the model with matching identifiers."
-                )
-                st.write("First 20 columns in your file (normalized):", list(raw.columns[:20]))
+                st.error("Still no overlap after normalization and mapping. "
+                         "Your file may use non-human IDs or unsupported aliases. "
+                         "Please check the first few column names.")
+                st.write("First 20 columns (normalized):", list(raw.columns[:20]))
                 st.write("First 20 model features:", FEATURES_NORM[:20])
                 st.stop()
 
+            # Align & show
             X = align_to_features(raw, FEATURES_NORM)
             st.write("Aligned shape (samples × training features):", tuple(X.shape))
             st.dataframe(X.head(), use_container_width=True)
@@ -188,7 +238,6 @@ with tab1:
 with tab2:
     st.subheader("Paste one sample (two lines)")
     st.caption("Line 1: comma-separated gene names. Line 2: comma-separated values.")
-
     head_preview = ",".join(FEATURES_NORM[:25]) + ("..." if len(FEATURES_NORM) > 25 else "")
     vals_preview = ",".join(["0"] * min(25, len(FEATURES_NORM))) + ("..." if len(FEATURES_NORM) > 25 else "")
     txt = st.text_area("Paste here", value=head_preview + "\n" + vals_preview, height=140)
@@ -200,6 +249,16 @@ with tab2:
                 raise ValueError("Provide two lines: header then values.")
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals  = [float(x.strip()) for x in lines[1].split(",")]
+
+            # Map pasted header if needed
+            model_id_type = detect_id_system(pd.Index(FEATURES_NORM))
+            incoming_id_type = detect_id_system(pd.Index(genes))
+            if model_id_type != incoming_id_type:
+                if mygene is None:
+                    st.error("Auto-mapping requires the 'mygene' package. Add 'mygene' to requirements.txt.")
+                    st.stop()
+                genes = list(map_ids(pd.Index(genes), incoming_id_type, model_id_type))
+
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES_NORM)
             proba = model.predict_proba(X)
@@ -213,3 +272,5 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
+
+
