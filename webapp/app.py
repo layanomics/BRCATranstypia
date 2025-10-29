@@ -1,4 +1,4 @@
-# app.py — unified demo for multi-panel BRCA subtype prediction (stats-aligned)
+# app.py — BRCA subtype predictor (fixed: pass DataFrame to predict_proba)
 from pathlib import Path
 import json, io, re
 import numpy as np
@@ -21,7 +21,7 @@ def find_root(start: Path) -> Path:
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 
-# ---------- define model bundles ----------
+# ---------- model bundles ----------
 BIG = {
     "model": ROOT / "models" / "model.joblib",
     "feats": ROOT / "models" / "features.txt",
@@ -38,12 +38,8 @@ SMALL = {
 }
 ID_MAP_PATH = ROOT / "models" / "id_map.csv"
 
-# ---------- helpers for stats alignment ----------
-def _align_stats_to_feats(mu: np.ndarray, sd: np.ndarray, feats_stats: list[str], feats: list[str]):
-    """
-    Reorder saved mean/std arrays to match the current 'feats' order.
-    If a feature is missing in feats_stats, fallback mean=0, std=1.
-    """
+# ---------- helper for aligning stats ----------
+def _align_stats_to_feats(mu, sd, feats_stats, feats):
     if mu is None or sd is None or feats_stats is None:
         return None, None
     pos = {name: i for i, name in enumerate(feats_stats)}
@@ -57,7 +53,7 @@ def _align_stats_to_feats(mu: np.ndarray, sd: np.ndarray, feats_stats: list[str]
             sd2[j] = float(sd_safe)
     return mu2, sd2
 
-# ---------- load models ----------
+# ---------- load model ----------
 @st.cache_resource
 def load_bundle(bundle):
     model = joblib.load(bundle["model"])
@@ -71,7 +67,6 @@ def load_bundle(bundle):
     if Path(bundle["stats"]).exists():
         z = np.load(bundle["stats"], allow_pickle=False)
         mu_raw, sd_raw, feats_stats = z["mean"], z["std"], list(z["features"])
-        # NEW: align stats to the *current* feature order
         mu, sd = _align_stats_to_feats(mu_raw, sd_raw, feats_stats, feats)
 
     return model, feats, classes, mu, sd
@@ -118,28 +113,14 @@ def map_cols_to_bundle(cols: list[str], feats: list[str]) -> pd.Index:
 
 def parse_any_table(upload) -> pd.DataFrame:
     raw = upload.getvalue()
-    b1 = io.BytesIO(raw); b2 = io.BytesIO(raw)
+    b1 = io.BytesIO(raw)
     try:
         df = pd.read_csv(b1)
         if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
             return df
     except Exception:
         pass
-    try:
-        df2 = pd.read_csv(io.BytesIO(raw), header=None, names=["gene", "value"])
-        if df2.shape[1] == 2 and df2["gene"].astype(str).str.len().gt(0).any():
-            return pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist(), index=["sample_1"])
-    except Exception:
-        pass
-    try:
-        txt = b2.getvalue().decode("utf-8").strip()
-        if "," in txt and "\n" not in txt and txt.count(",") > 10:
-            vals = [float(x.strip()) for x in txt.split(",")]
-            cols = [f"g{i}" for i in range(len(vals))]
-            return pd.DataFrame([vals], columns=cols, index=["sample_1"])
-    except Exception:
-        pass
-    raise ValueError("Unrecognized file format. Please upload a CSV (samples×genes) or a simple vector.")
+    raise ValueError("Unrecognized file format. Please upload a CSV (samples×genes).")
 
 def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFrame:
     if df.columns[0].lower() in {"gene", "genes", "symbol", "gene_symbol"}:
@@ -156,13 +137,10 @@ tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
-    st.caption("Columns = genes, rows = samples. If your file has genes as rows, it will auto-pivot.")
     up = st.file_uploader("Choose a CSV file", type=["csv"])
     if up is not None:
         try:
             raw = parse_any_table(up)
-            st.write("Detected shape:", tuple(raw.shape))
-
             normed_cols = [norm_gene(c) for c in raw.columns]
             mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
             mapped_big   = map_cols_to_bundle(normed_cols, FEATS_BIG)
@@ -179,7 +157,6 @@ with tab1:
             overlap = len(set(raw.columns) & set(FEATS))
             X = align_to_features(raw, FEATS)
 
-            # normalization: use TRAINING stats (aligned) if available
             if MU is not None and SD is not None and len(MU) == X.shape[1]:
                 Xv = (X.values - MU) / SD
             else:
@@ -188,7 +165,10 @@ with tab1:
                 sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
                 Xv = (X.values - mu_local) / sd_local
 
-            proba = mdl.predict_proba(Xv)
+            # --- NEW: keep feature names when predicting ---
+            Xv_df = pd.DataFrame(Xv, columns=FEATS, index=X.index)
+            proba = mdl.predict_proba(Xv_df)
+
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols, index=X.index)
             conf = preds.max(axis=1)
@@ -248,7 +228,10 @@ with tab2:
                 sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
                 Xv = (X.values - mu_local) / sd_local
 
-            proba = mdl.predict_proba(Xv)
+            # --- NEW: keep feature names when predicting ---
+            Xv_df = pd.DataFrame(Xv, columns=FEATS, index=X.index)
+            proba = mdl.predict_proba(Xv_df)
+
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols, index=["sample_1"])
             conf = preds.max(axis=1).iloc[0]
@@ -260,6 +243,8 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational research prototype")
+
+
 
 
 
