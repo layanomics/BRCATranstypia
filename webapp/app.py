@@ -1,4 +1,4 @@
-# app.py — unified demo for multi-panel BRCA subtype prediction
+# app.py — unified demo for multi-panel BRCA subtype prediction (final stable)
 from pathlib import Path
 import json, io, re
 import numpy as np
@@ -73,6 +73,26 @@ def norm_gene(x: str) -> str:
         s = s.split(".")[0]
     return s
 
+def build_unver_to_exact(feats: list[str]) -> dict[str, str]:
+    m = {}
+    for f in feats:
+        fu = f.split(".")[0].upper() if f.upper().startswith("ENSG") else f
+        m[fu] = f
+    return m
+
+def map_cols_to_bundle(cols: list[str], feats: list[str]) -> pd.Index:
+    UNVER2EXACT = build_unver_to_exact(feats)
+    out = []
+    for c in cols:
+        n = norm_gene(c)
+        if n.startswith("ENSG"):
+            exact = n if n in feats else UNVER2EXACT.get(n.split(".")[0], n)
+        else:
+            ens_unv = SYM2ENS.get(n, n)
+            exact = UNVER2EXACT.get(ens_unv, ens_unv)
+        out.append(exact)
+    return pd.Index(out)
+
 def parse_any_table(upload) -> pd.DataFrame:
     raw = upload.getvalue()
     b1 = io.BytesIO(raw); b2 = io.BytesIO(raw)
@@ -108,19 +128,6 @@ def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFram
     out = out[features_norm].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     return out
 
-def choose_model(upload_cols: list[str]) -> tuple:
-    ov_small = len(set(upload_cols) & set(FEATS_SMALL))
-    ov_big = len(set(upload_cols) & set(FEATS_BIG))
-    pct_small = ov_small / max(1, len(FEATS_SMALL)) * 100
-    pct_big = ov_big / max(1, len(FEATS_BIG)) * 100
-
-    if ov_small >= ov_big or pct_small >= 60:
-        st.sidebar.success(f"Using compact panel-5k model ({ov_small}/{len(FEATS_SMALL)} overlap)")
-        return "panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL
-    else:
-        st.sidebar.info(f"Using full-60k model ({ov_big}/{len(FEATS_BIG)} overlap)")
-        return "full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG
-
 # ---------- UI ----------
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
@@ -133,8 +140,19 @@ with tab1:
             raw = parse_any_table(up)
             st.write("Detected shape:", tuple(raw.shape))
 
-            raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
-            model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = choose_model(list(raw.columns))
+            normed_cols = [norm_gene(c) for c in raw.columns]
+            mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
+            mapped_big = map_cols_to_bundle(normed_cols, FEATS_BIG)
+            ov_small = len(set(mapped_small) & set(FEATS_SMALL))
+            ov_big = len(set(mapped_big) & set(FEATS_BIG))
+
+            if ov_small >= ov_big:
+                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL)
+                raw.columns = mapped_small
+            else:
+                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG)
+                raw.columns = mapped_big
+
             overlap = len(set(raw.columns) & set(FEATS))
             X = align_to_features(raw, FEATS)
 
@@ -182,7 +200,20 @@ with tab2:
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals = [float(x.strip()) for x in lines[1].split(",")]
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
-            model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = choose_model(list(df.columns))
+
+            normed_cols = [norm_gene(c) for c in df.columns]
+            mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
+            mapped_big = map_cols_to_bundle(normed_cols, FEATS_BIG)
+            ov_small = len(set(mapped_small) & set(FEATS_SMALL))
+            ov_big = len(set(mapped_big) & set(FEATS_BIG))
+
+            if ov_small >= ov_big:
+                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL)
+                df.columns = mapped_small
+            else:
+                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG)
+                df.columns = mapped_big
+
             overlap = len(set(df.columns) & set(FEATS))
             X = align_to_features(df, FEATS)
 
@@ -206,4 +237,5 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational research prototype")
+
 
