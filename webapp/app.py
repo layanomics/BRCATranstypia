@@ -1,4 +1,4 @@
-# app.py — offline gene ID mapping + robust upload + immediate prediction
+# app.py — offline gene ID mapping + stable upload via session_state + immediate prediction
 from pathlib import Path
 import json, io, re
 import numpy as np
@@ -25,7 +25,7 @@ st.sidebar.caption(f"ROOT: {ROOT}")
 MODEL_PATH   = ROOT / "models" / "model.joblib"
 FEATURES_TXT = ROOT / "models" / "features.txt"
 CLASSES_JSON = ROOT / "models" / "classes.json"
-ID_MAP_PATH  = ROOT / "models" / "id_map.csv"   # <-- offline map built once
+ID_MAP_PATH  = ROOT / "models" / "id_map.csv"   # built offline
 
 # ---------- load model & metadata ----------
 @st.cache_resource
@@ -33,8 +33,6 @@ def load_assets():
     model = joblib.load(MODEL_PATH)
     features = [ln.strip() for ln in FEATURES_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
     classes = json.loads(CLASSES_JSON.read_text()) if CLASSES_JSON.exists() else list(getattr(model, "classes_", []))
-
-    # load offline map (fail clearly if missing)
     if not ID_MAP_PATH.exists():
         raise FileNotFoundError(f"Missing ID map at {ID_MAP_PATH}. Commit & push models/id_map.csv.")
     id_map = pd.read_csv(ID_MAP_PATH)
@@ -48,7 +46,6 @@ def load_assets():
 try:
     model, FEATURES_RAW, CLASSES, SYM2ENS, ENS2SYM = load_assets()
     st.sidebar.success(f"Model loaded • {len(FEATURES_RAW)} features")
-    st.sidebar.write("Model path:", MODEL_PATH)
     st.sidebar.success("Loaded ID map")
 except Exception as e:
     st.exception(e); st.stop()
@@ -121,7 +118,33 @@ def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFram
     out = out[features_norm].apply(pd.to_numeric, errors="coerce").fillna(0.0)
     return out
 
-# ---------- UI ----------
+def predict_proba_safe(mdl, X: pd.DataFrame) -> np.ndarray:
+    """Use predict_proba if available; else fall back to decision_function -> softmax."""
+    if hasattr(mdl, "predict_proba"):
+        return mdl.predict_proba(X)
+    # decision_function fallback (e.g., SVM without probability=True)
+    if hasattr(mdl, "decision_function"):
+        scores = mdl.decision_function(X)
+        scores = np.atleast_2d(scores)
+        # if binary and shape is (n,), convert to (n,2)
+        if scores.ndim == 2 and scores.shape[1] == 1:
+            scores = np.hstack([-scores, scores])
+        # softmax
+        e = np.exp(scores - scores.max(axis=1, keepdims=True))
+        return e / e.sum(axis=1, keepdims=True)
+    # last resort: one-hot from predict (not probabilistic)
+    preds = mdl.predict(X)
+    classes = getattr(mdl, "classes_", np.unique(preds))
+    onehot = np.zeros((len(preds), len(classes)), dtype=float)
+    class_to_idx = {c: i for i, c in enumerate(classes)}
+    for i, p in enumerate(preds):
+        onehot[i, class_to_idx[p]] = 1.0
+    return onehot
+
+# ---------- session state for stable uploads ----------
+if "upload_bytes" not in st.session_state:
+    st.session_state.upload_bytes = None
+
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
 with tab1:
@@ -129,10 +152,20 @@ with tab1:
     st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
     up = st.file_uploader("Choose a CSV file", type=["csv"])
 
+    # Persist bytes across reruns
     if up is not None:
+        st.session_state.upload_bytes = up.getvalue()
+
+    # Clear button
+    cols_btn = st.columns([1,1,6])
+    with cols_btn[0]:
+        if st.button("🔄 Clear file"):
+            st.session_state.upload_bytes = None
+            st.experimental_rerun()
+
+    if st.session_state.upload_bytes is not None:
         try:
-            raw_bytes = up.getvalue()           # keep bytes stable across reruns
-            raw = parse_from_bytes(raw_bytes)
+            raw = parse_from_bytes(st.session_state.upload_bytes)
             st.write("Detected shape:", tuple(raw.shape))
 
             # normalize header
@@ -161,7 +194,7 @@ with tab1:
             st.write("Aligned shape (samples × training features):", tuple(X.shape))
             st.dataframe(X.head(), use_container_width=True)
 
-            proba = model.predict_proba(X)
+            proba = predict_proba_safe(model, X)
             cols = CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols,
                                  index=X.index if X.index.is_unique else range(len(X)))
@@ -175,11 +208,11 @@ with tab1:
                                out.to_csv(index=True).encode("utf-8"),
                                file_name="predictions.csv",
                                mime="text/csv")
+
             st.success("Done ✅")
-            st.stop()  # prevent jumping back to uploader
 
         except Exception as e:
-            st.exception(e); st.stop()
+            st.exception(e)
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
@@ -195,14 +228,13 @@ with tab2:
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals  = [float(x.strip()) for x in lines[1].split(",")]
 
-            # map pasted header if needed
             model_ids = detect_id_system(FEATURES_NORM)
             pasted_ids= detect_id_system(genes)
             genes = list(auto_map_cols(pd.Index(genes), model_ids, pasted_ids))
 
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES_NORM)
-            proba = model.predict_proba(X)
+            proba = predict_proba_safe(model, X)
             cols = CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols, index=["sample_1"])
             st.subheader("Predicted probabilities")
@@ -213,6 +245,7 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
+
 
 
 
