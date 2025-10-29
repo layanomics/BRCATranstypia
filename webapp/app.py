@@ -119,20 +119,16 @@ def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFram
     return out
 
 def predict_proba_safe(mdl, X: pd.DataFrame) -> np.ndarray:
-    """Use predict_proba if available; else fall back to decision_function -> softmax."""
+    """Use predict_proba if available; else decision_function→softmax; else one-hot predict."""
     if hasattr(mdl, "predict_proba"):
         return mdl.predict_proba(X)
-    # decision_function fallback (e.g., SVM without probability=True)
     if hasattr(mdl, "decision_function"):
         scores = mdl.decision_function(X)
         scores = np.atleast_2d(scores)
-        # if binary and shape is (n,), convert to (n,2)
         if scores.ndim == 2 and scores.shape[1] == 1:
-            scores = np.hstack([-scores, scores])
-        # softmax
+            scores = np.hstack([-scores, scores])  # binary case
         e = np.exp(scores - scores.max(axis=1, keepdims=True))
         return e / e.sum(axis=1, keepdims=True)
-    # last resort: one-hot from predict (not probabilistic)
     preds = mdl.predict(X)
     classes = getattr(mdl, "classes_", np.unique(preds))
     onehot = np.zeros((len(preds), len(classes)), dtype=float)
@@ -147,72 +143,79 @@ if "upload_bytes" not in st.session_state:
 
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
+# =========================
+# REPLACED TAB1 BLOCK START
+# =========================
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
     st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
-    up = st.file_uploader("Choose a CSV file", type=["csv"])
 
-    # Persist bytes across reruns
-    if up is not None:
-        st.session_state.upload_bytes = up.getvalue()
+    # --- upload once ---
+    uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
+    if uploaded:
+        st.session_state.upload_bytes = uploaded.getvalue()
 
-    # Clear button
-    cols_btn = st.columns([1,1,6])
-    with cols_btn[0]:
-        if st.button("🔄 Clear file"):
-            st.session_state.upload_bytes = None
-            st.experimental_rerun()
+    # --- clear/reset button ---
+    if st.session_state.get("upload_bytes"):
+        c1, c2, _ = st.columns([1, 1, 8])
+        with c1:
+            if st.button("🔄 Clear file"):
+                st.session_state.upload_bytes = None
+                st.experimental_rerun()
+    else:
+        st.stop()  # wait for file before proceeding
 
-    if st.session_state.upload_bytes is not None:
-        try:
-            raw = parse_from_bytes(st.session_state.upload_bytes)
-            st.write("Detected shape:", tuple(raw.shape))
+    # --- process stable bytes ---
+    try:
+        raw = parse_from_bytes(st.session_state.upload_bytes)
+        st.write("Detected shape:", tuple(raw.shape))
 
-            # normalize header
-            raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
+        # normalize headers + map
+        raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
+        model_ids    = detect_id_system(FEATURES_NORM)
+        uploaded_ids = detect_id_system(raw.columns)
+        st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
 
-            # detect & offline map (no internet)
-            model_ids    = detect_id_system(FEATURES_NORM)
-            uploaded_ids = detect_id_system(raw.columns)
-            st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
+        if model_ids != uploaded_ids:
+            raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
+            st.info("Applied automatic gene ID mapping (offline).")
 
-            if model_ids != uploaded_ids:
-                raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
-                st.info("Applied automatic gene ID mapping (offline).")
+        # overlap
+        overlap = len(set(raw.columns) & set(FEATURES_NORM))
+        st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
+        if overlap < 50:
+            st.error("Too few overlapping genes to predict confidently (need ≥ 50).")
+            st.write("First 20 columns (normalized):", list(raw.columns[:20]))
+            st.write("First 20 model features:", FEATURES_NORM[:20])
+            st.stop()
 
-            # diagnostics
-            overlap = len(set(raw.columns) & set(FEATURES_NORM))
-            st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
-            if overlap < 50:
-                st.error("Too few overlapping genes to predict confidently (need ≥ 50).")
-                st.write("First 20 columns (normalized):", list(raw.columns[:20]))
-                st.write("First 20 model features:", FEATURES_NORM[:20])
-                st.stop()
+        # --- predict ---
+        X = align_to_features(raw, FEATURES_NORM)
+        st.write("Aligned shape:", tuple(X.shape))
+        st.dataframe(X.head(), use_container_width=True)
 
-            # align → predict → render
-            X = align_to_features(raw, FEATURES_NORM)
-            st.write("Aligned shape (samples × training features):", tuple(X.shape))
-            st.dataframe(X.head(), use_container_width=True)
+        proba = predict_proba_safe(model, X)
+        cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
+        preds = pd.DataFrame(proba, columns=cols, index=X.index if X.index.is_unique else range(len(X)))
 
-            proba = predict_proba_safe(model, X)
-            cols = CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])]
-            preds = pd.DataFrame(proba, columns=cols,
-                                 index=X.index if X.index.is_unique else range(len(X)))
+        st.subheader("Predicted probabilities")
+        st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
 
-            st.subheader("Predicted probabilities")
-            st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
+        top = preds.idxmax(axis=1).rename("predicted_subtype")
+        out = pd.concat([top, preds], axis=1)
+        st.download_button(
+            "📥 Download predictions (CSV)",
+            out.to_csv(index=True).encode("utf-8"),
+            file_name="predictions.csv",
+            mime="text/csv"
+        )
+        st.success("✅ Prediction complete")
 
-            top = preds.idxmax(axis=1).rename("predicted_subtype")
-            out = pd.concat([top, preds], axis=1)
-            st.download_button("📥 Download predictions (CSV)",
-                               out.to_csv(index=True).encode("utf-8"),
-                               file_name="predictions.csv",
-                               mime="text/csv")
-
-            st.success("Done ✅")
-
-        except Exception as e:
-            st.exception(e)
+    except Exception as e:
+        st.exception(e)
+# =======================
+# REPLACED TAB1 BLOCK END
+# =======================
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
@@ -224,7 +227,8 @@ with tab2:
     if st.button("Predict (pasted)"):
         try:
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
-            if len(lines) < 2: raise ValueError("Provide two lines: header then values.")
+            if len(lines) < 2:
+                raise ValueError("Provide two lines: header then values.")
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals  = [float(x.strip()) for x in lines[1].split(",")]
 
@@ -235,7 +239,7 @@ with tab2:
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES_NORM)
             proba = predict_proba_safe(model, X)
-            cols = CLASSES if len(CLASSES) else [f"class_{i}" for i in range(proba.shape[1])]
+            cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
             preds = pd.DataFrame(proba, columns=cols, index=["sample_1"])
             st.subheader("Predicted probabilities")
             st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
@@ -245,10 +249,3 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
-
-
-
-
-
-
-
