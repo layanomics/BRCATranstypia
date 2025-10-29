@@ -1,4 +1,4 @@
-# app.py — unified demo for multi-panel BRCA subtype prediction (final stable)
+# app.py — unified demo for multi-panel BRCA subtype prediction (stats-aligned)
 from pathlib import Path
 import json, io, re
 import numpy as np
@@ -38,6 +38,25 @@ SMALL = {
 }
 ID_MAP_PATH = ROOT / "models" / "id_map.csv"
 
+# ---------- helpers for stats alignment ----------
+def _align_stats_to_feats(mu: np.ndarray, sd: np.ndarray, feats_stats: list[str], feats: list[str]):
+    """
+    Reorder saved mean/std arrays to match the current 'feats' order.
+    If a feature is missing in feats_stats, fallback mean=0, std=1.
+    """
+    if mu is None or sd is None or feats_stats is None:
+        return None, None
+    pos = {name: i for i, name in enumerate(feats_stats)}
+    mu2 = np.zeros(len(feats), dtype="float32")
+    sd2 = np.ones(len(feats), dtype="float32")
+    for j, name in enumerate(feats):
+        i = pos.get(name)
+        if i is not None:
+            sd_safe = sd[i] if sd[i] != 0 else 1.0
+            mu2[j] = float(mu[i])
+            sd2[j] = float(sd_safe)
+    return mu2, sd2
+
 # ---------- load models ----------
 @st.cache_resource
 def load_bundle(bundle):
@@ -47,14 +66,18 @@ def load_bundle(bundle):
         classes = json.loads(Path(bundle["classes"]).read_text())
     else:
         classes = list(getattr(model, "classes_", []))
+
     mu = sd = feats_stats = None
     if Path(bundle["stats"]).exists():
-        z = np.load(bundle["stats"])
-        mu, sd, feats_stats = z["mean"], z["std"], list(z["features"])
-    return model, feats, classes, mu, sd, feats_stats
+        z = np.load(bundle["stats"], allow_pickle=False)
+        mu_raw, sd_raw, feats_stats = z["mean"], z["std"], list(z["features"])
+        # NEW: align stats to the *current* feature order
+        mu, sd = _align_stats_to_feats(mu_raw, sd_raw, feats_stats, feats)
 
-model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG = load_bundle(BIG)
-model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL = load_bundle(SMALL)
+    return model, feats, classes, mu, sd
+
+model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG   = load_bundle(BIG)
+model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL = load_bundle(SMALL)
 
 # ---------- load ID map ----------
 id_map = pd.read_csv(ID_MAP_PATH)
@@ -64,7 +87,7 @@ id_map["symbol"] = id_map["symbol"].astype(str).str.upper()
 SYM2ENS = dict(zip(id_map["symbol"], id_map["ensembl"]))
 ENS2SYM = dict(zip(id_map["ensembl"], id_map["symbol"]))
 
-# ---------- helpers ----------
+# ---------- gene helpers ----------
 ENSEMBL_RE = re.compile(r"^ENSG\d+", re.I)
 
 def norm_gene(x: str) -> str:
@@ -142,30 +165,28 @@ with tab1:
 
             normed_cols = [norm_gene(c) for c in raw.columns]
             mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
-            mapped_big = map_cols_to_bundle(normed_cols, FEATS_BIG)
+            mapped_big   = map_cols_to_bundle(normed_cols, FEATS_BIG)
             ov_small = len(set(mapped_small) & set(FEATS_SMALL))
-            ov_big = len(set(mapped_big) & set(FEATS_BIG))
+            ov_big   = len(set(mapped_big)   & set(FEATS_BIG))
 
             if ov_small >= ov_big:
-                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL)
+                model_name, mdl, FEATS, CLASSES, MU, SD = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL)
                 raw.columns = mapped_small
             else:
-                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG)
+                model_name, mdl, FEATS, CLASSES, MU, SD = ("full-60k",  model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG)
                 raw.columns = mapped_big
 
             overlap = len(set(raw.columns) & set(FEATS))
             X = align_to_features(raw, FEATS)
 
-            # normalization
-            # normalize using training stats if available (same order)
+            # normalization: use TRAINING stats (aligned) if available
             if MU is not None and SD is not None and len(MU) == X.shape[1]:
-               Xv = (X.values - MU) / SD
+                Xv = (X.values - MU) / SD
             else:
-               # fallback only if stats missing
-               mu_local = X.mean(axis=0).values
-               sd_local = X.std(axis=0).values
-               sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
-               Xv = (X.values - mu_local) / sd_local
+                mu_local = X.mean(axis=0).values
+                sd_local = X.std(axis=0).values
+                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
+                Xv = (X.values - mu_local) / sd_local
 
             proba = mdl.predict_proba(Xv)
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
@@ -200,26 +221,26 @@ with tab2:
             if len(lines) < 2:
                 raise ValueError("Provide two lines: header then values.")
             genes = [norm_gene(g) for g in lines[0].split(",")]
-            vals = [float(x.strip()) for x in lines[1].split(",")]
+            vals  = [float(x.strip()) for x in lines[1].split(",")]
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
 
             normed_cols = [norm_gene(c) for c in df.columns]
             mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
-            mapped_big = map_cols_to_bundle(normed_cols, FEATS_BIG)
+            mapped_big   = map_cols_to_bundle(normed_cols, FEATS_BIG)
             ov_small = len(set(mapped_small) & set(FEATS_SMALL))
-            ov_big = len(set(mapped_big) & set(FEATS_BIG))
+            ov_big   = len(set(mapped_big)   & set(FEATS_BIG))
 
             if ov_small >= ov_big:
-                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL, FSTATS_SMALL)
+                model_name, mdl, FEATS, CLASSES, MU, SD = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL)
                 df.columns = mapped_small
             else:
-                model_name, mdl, FEATS, CLASSES, MU, SD, FSTATS = ("full-60k", model_big, FEATS_BIG, CLASSES_BIG, MU_BIG, SD_BIG, FSTATS_BIG)
+                model_name, mdl, FEATS, CLASSES, MU, SD = ("full-60k",  model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG)
                 df.columns = mapped_big
 
             overlap = len(set(df.columns) & set(FEATS))
             X = align_to_features(df, FEATS)
 
-            if MU is not None and FSTATS is not None:
+            if MU is not None and SD is not None and len(MU) == X.shape[1]:
                 Xv = (X.values - MU) / SD
             else:
                 mu_local = X.mean(axis=0).values
@@ -239,5 +260,6 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational research prototype")
+
 
 
