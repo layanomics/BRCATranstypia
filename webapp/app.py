@@ -20,6 +20,8 @@ def find_root(start: Path) -> Path:
 
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
+st.sidebar.caption(f"ROOT: {ROOT}")
+
 MODEL_PATH   = ROOT / "models" / "model.joblib"
 FEATURES_TXT = ROOT / "models" / "features.txt"
 CLASSES_JSON = ROOT / "models" / "classes.json"
@@ -31,7 +33,10 @@ def load_assets():
     model = joblib.load(MODEL_PATH)
     features = [ln.strip() for ln in FEATURES_TXT.read_text(encoding="utf-8").splitlines() if ln.strip()]
     classes = json.loads(CLASSES_JSON.read_text()) if CLASSES_JSON.exists() else list(getattr(model, "classes_", []))
-    # load offline map
+
+    # load offline map (fail clearly if missing)
+    if not ID_MAP_PATH.exists():
+        raise FileNotFoundError(f"Missing ID map at {ID_MAP_PATH}. Commit & push models/id_map.csv.")
     id_map = pd.read_csv(ID_MAP_PATH)
     id_map.columns = [c.lower() for c in id_map.columns]
     id_map["ensembl"] = id_map["ensembl"].astype(str).str.upper().str.replace(r"\.\d+$", "", regex=True)
@@ -44,6 +49,7 @@ try:
     model, FEATURES_RAW, CLASSES, SYM2ENS, ENS2SYM = load_assets()
     st.sidebar.success(f"Model loaded • {len(FEATURES_RAW)} features")
     st.sidebar.write("Model path:", MODEL_PATH)
+    st.sidebar.success("Loaded ID map")
 except Exception as e:
     st.exception(e); st.stop()
 
@@ -62,7 +68,7 @@ def normalized_features():
 FEATURES_NORM = normalized_features()
 
 def detect_id_system(names) -> str:
-    names = [str(x) for x in names]
+    names = [str(x).upper() for x in names]
     ens = sum(1 for x in names[:500] if ENSEMBL_RE.match(x))
     return "ENSEMBL" if ens >= max(5, int(0.3 * max(1, len(names[:500])))) else "SYMBOL"
 
@@ -78,21 +84,23 @@ def auto_map_cols(cols: pd.Index, model_ids: str, uploaded_ids: str) -> pd.Index
             out.append(n)
     return pd.Index(out)
 
-def parse_any_table(upload) -> pd.DataFrame:
-    raw = upload.getvalue()
-    b1 = io.BytesIO(raw); b2 = io.BytesIO(raw)
+def parse_from_bytes(raw_bytes: bytes) -> pd.DataFrame:
+    b1 = io.BytesIO(raw_bytes); b2 = io.BytesIO(raw_bytes)
+    # matrix / gene-rows
     try:
         df = pd.read_csv(b1)
         if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
             return df
     except Exception:
         pass
+    # two-column gene,value
     try:
-        df2 = pd.read_csv(io.BytesIO(raw), header=None, names=["gene", "value"])
+        df2 = pd.read_csv(io.BytesIO(raw_bytes), header=None, names=["gene", "value"])
         if df2.shape[1] == 2 and df2["gene"].astype(str).str.len().gt(0).any():
             return pd.DataFrame([df2["value"].tolist()], columns=df2["gene"].tolist(), index=["sample_1"])
     except Exception:
         pass
+    # single comma-separated line
     try:
         txt = b2.getvalue().decode("utf-8").strip()
         if "," in txt and "\n" not in txt and txt.count(",") > 10:
@@ -123,10 +131,14 @@ with tab1:
 
     if up is not None:
         try:
-            raw = parse_any_table(up)
+            raw_bytes = up.getvalue()           # keep bytes stable across reruns
+            raw = parse_from_bytes(raw_bytes)
             st.write("Detected shape:", tuple(raw.shape))
 
+            # normalize header
             raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
+
+            # detect & offline map (no internet)
             model_ids    = detect_id_system(FEATURES_NORM)
             uploaded_ids = detect_id_system(raw.columns)
             st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
@@ -135,6 +147,7 @@ with tab1:
                 raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
                 st.info("Applied automatic gene ID mapping (offline).")
 
+            # diagnostics
             overlap = len(set(raw.columns) & set(FEATURES_NORM))
             st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
             if overlap < 50:
@@ -143,6 +156,7 @@ with tab1:
                 st.write("First 20 model features:", FEATURES_NORM[:20])
                 st.stop()
 
+            # align → predict → render
             X = align_to_features(raw, FEATURES_NORM)
             st.write("Aligned shape (samples × training features):", tuple(X.shape))
             st.dataframe(X.head(), use_container_width=True)
@@ -162,7 +176,8 @@ with tab1:
                                file_name="predictions.csv",
                                mime="text/csv")
             st.success("Done ✅")
-            st.stop()
+            st.stop()  # prevent jumping back to uploader
+
         except Exception as e:
             st.exception(e); st.stop()
 
@@ -179,10 +194,12 @@ with tab2:
             if len(lines) < 2: raise ValueError("Provide two lines: header then values.")
             genes = [norm_gene(g) for g in lines[0].split(",")]
             vals  = [float(x.strip()) for x in lines[1].split(",")]
+
             # map pasted header if needed
             model_ids = detect_id_system(FEATURES_NORM)
             pasted_ids= detect_id_system(genes)
             genes = list(auto_map_cols(pd.Index(genes), model_ids, pasted_ids))
+
             df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
             X = align_to_features(df, FEATURES_NORM)
             proba = model.predict_proba(X)
@@ -196,6 +213,7 @@ with tab2:
 
 st.divider()
 st.caption("Model & app © BRCATranstypia • Educational demo")
+
 
 
 
