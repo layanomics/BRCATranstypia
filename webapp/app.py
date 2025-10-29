@@ -157,13 +157,15 @@ with tab1:
             X = align_to_features(raw, FEATS)
 
             # normalization
-            if MU is not None and FSTATS is not None:
-                Xv = (X.values - MU) / SD
+            # normalize using training stats if available (same order)
+            if MU is not None and SD is not None and len(MU) == X.shape[1]:
+               Xv = (X.values - MU) / SD
             else:
-                mu_local = X.mean(axis=0).values
-                sd_local = X.std(axis=0).values
-                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
-                Xv = (X.values - mu_local) / sd_local
+               # fallback only if stats missing
+               mu_local = X.mean(axis=0).values
+               sd_local = X.std(axis=0).values
+               sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
+               Xv = (X.values - mu_local) / sd_local
 
             proba = mdl.predict_proba(Xv)
             cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
