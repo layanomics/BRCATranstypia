@@ -143,79 +143,66 @@ if "upload_bytes" not in st.session_state:
 
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
-# =========================
-# REPLACED TAB1 BLOCK START
-# =========================
+
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
     st.caption("Columns = genes, rows = samples. If your file has genes as rows, the app will auto-pivot.")
-
-    # --- upload once ---
+    
     uploaded = st.file_uploader("Choose a CSV file", type=["csv"])
     if uploaded:
         st.session_state.upload_bytes = uploaded.getvalue()
 
-    # --- clear/reset button ---
-    if st.session_state.get("upload_bytes"):
-        c1, c2, _ = st.columns([1, 1, 8])
-        with c1:
-            if st.button("🔄 Clear file"):
-                st.session_state.upload_bytes = None
-                st.experimental_rerun()
+    if not st.session_state.get("upload_bytes"):
+        st.info("⬆️ Upload a CSV file to start.")
     else:
-        st.stop()  # wait for file before proceeding
+        if st.button("🔄 Clear file"):
+            st.session_state.upload_bytes = None
+            st.experimental_rerun()
 
-    # --- process stable bytes ---
-    try:
-        raw = parse_from_bytes(st.session_state.upload_bytes)
-        st.write("Detected shape:", tuple(raw.shape))
+        try:
+            raw = parse_from_bytes(st.session_state.upload_bytes)
+            st.write("Detected shape:", tuple(raw.shape))
 
-        # normalize headers + map
-        raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
-        model_ids    = detect_id_system(FEATURES_NORM)
-        uploaded_ids = detect_id_system(raw.columns)
-        st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
+            raw.columns = pd.Index([norm_gene(c) for c in raw.columns])
+            model_ids    = detect_id_system(FEATURES_NORM)
+            uploaded_ids = detect_id_system(raw.columns)
+            st.write(f"Model IDs: **{model_ids}**, Uploaded IDs: **{uploaded_ids}**")
 
-        if model_ids != uploaded_ids:
-            raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
-            st.info("Applied automatic gene ID mapping (offline).")
+            if model_ids != uploaded_ids:
+                raw.columns = auto_map_cols(raw.columns, model_ids, uploaded_ids)
+                st.info("Applied automatic gene ID mapping (offline).")
 
-        # overlap
-        overlap = len(set(raw.columns) & set(FEATURES_NORM))
-        st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
-        if overlap < 50:
-            st.error("Too few overlapping genes to predict confidently (need ≥ 50).")
-            st.write("First 20 columns (normalized):", list(raw.columns[:20]))
-            st.write("First 20 model features:", FEATURES_NORM[:20])
-            st.stop()
+            overlap = len(set(raw.columns) & set(FEATURES_NORM))
+            st.write(f"Feature overlap with training: {overlap} / {len(FEATURES_NORM)}")
 
-        # --- predict ---
-        X = align_to_features(raw, FEATURES_NORM)
-        st.write("Aligned shape:", tuple(X.shape))
-        st.dataframe(X.head(), use_container_width=True)
+            if overlap < 50:
+                st.warning("⚠️ Too few overlapping genes (<50). Predictions may be unreliable.")
+            
+            # --- align and predict ---
+            X = align_to_features(raw, FEATURES_NORM)
+            st.write("Aligned shape:", tuple(X.shape))
+            st.dataframe(X.head(), use_container_width=True)
 
-        proba = predict_proba_safe(model, X)
-        cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
-        preds = pd.DataFrame(proba, columns=cols, index=X.index if X.index.is_unique else range(len(X)))
+            proba = model.predict_proba(X)
+            cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
+            preds = pd.DataFrame(proba, columns=cols, index=X.index)
+            
+            st.subheader("Predicted probabilities")
+            st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
+            
+            top = preds.idxmax(axis=1).rename("predicted_subtype")
+            out = pd.concat([top, preds], axis=1)
+            st.download_button(
+                "📥 Download predictions (CSV)",
+                out.to_csv(index=True).encode("utf-8"),
+                file_name="predictions.csv",
+                mime="text/csv"
+            )
+            st.success("✅ Prediction complete")
 
-        st.subheader("Predicted probabilities")
-        st.dataframe(preds.style.format({c: "{:.3f}" for c in cols}), use_container_width=True)
+        except Exception as e:
+            st.exception(e)
 
-        top = preds.idxmax(axis=1).rename("predicted_subtype")
-        out = pd.concat([top, preds], axis=1)
-        st.download_button(
-            "📥 Download predictions (CSV)",
-            out.to_csv(index=True).encode("utf-8"),
-            file_name="predictions.csv",
-            mime="text/csv"
-        )
-        st.success("✅ Prediction complete")
-
-    except Exception as e:
-        st.exception(e)
-# =======================
-# REPLACED TAB1 BLOCK END
-# =======================
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
