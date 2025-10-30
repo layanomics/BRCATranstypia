@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (5k/60k auto-detect, demo download+predict, paste parser, RAW PDF link + inline)
+# app.py — BRCATranstypia (5k/60k auto-detect, robust paste, 60k demo forced, web PDF link + inline)
 
 from pathlib import Path
 import io, re, requests
@@ -13,27 +13,27 @@ st.set_page_config(page_title="BRCATranstypia", layout="wide")
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
 
-# --- User Guide (open in real browser tab + inline viewer) ---
+# --- User Guidelines (open in real browser tab + optional inline embed) ---
+# Use RAW file URL so it opens as a normal PDF in a new tab instead of the repo view.
 GUIDE_URL_RAW = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
 
 def show_user_guide_inline_and_link():
-    # Plain hyperlink (new real browser tab)
+    # Plain hyperlink (opens real browser tab)
     st.markdown(
-        f'<a href="{GUIDE_URL_RAW}" target="_blank" rel="noopener noreferrer">🌐 Open User Guidelines in new tab</a>',
+        f'<a href="{GUIDE_URL_RAW}" target="_blank" rel="noopener">📘 Open User Guidelines in a new tab</a>',
         unsafe_allow_html=True,
     )
-    # Inline embed (base64) as a collapsible viewer
+    # Collapsible inline viewer (best-effort; if blocked, the link above still works)
     try:
         r = requests.get(GUIDE_URL_RAW, timeout=10)
         r.raise_for_status()
         b64 = b64encode(r.content).decode("utf-8")
         st.markdown(
             f"""
-            <details>
-              <summary><b>📘 View User Guidelines (inline)</b></summary>
+            <details style="margin-top:.5rem;">
+              <summary><b>…or view it inline</b></summary>
               <div style="margin-top:10px;">
-                <iframe src="data:application/pdf;base64,{b64}"
-                        width="100%" height="700px"
+                <iframe src="data:application/pdf;base64,{b64}" width="100%" height="700px"
                         style="border:1px solid #ddd;border-radius:8px;"></iframe>
               </div>
             </details>
@@ -41,11 +41,11 @@ def show_user_guide_inline_and_link():
             unsafe_allow_html=True,
         )
     except Exception:
-        st.warning("Couldn’t embed the PDF inline. The link above still opens it in a new tab.")
+        st.warning("Couldn’t embed the PDF inline. Use the link above.")
 
 show_user_guide_inline_and_link()
 
-# ---- Confidence gate thresholds ----
+# ---- Confidence gate thresholds (displayed in sidebar) ----
 CONF_THRESH, MARGIN_THRESH, ENTROPY_THRESH = 0.85, 0.15, 1.40
 
 with st.sidebar:
@@ -125,7 +125,7 @@ def build_symbol_to_ensembl():
     return sym2ens
 
 SYM2ENS = build_symbol_to_ensembl()
-ENSEMBL_PAT = re.compile(r"ENSG\\d{9,}")
+ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
 
 def map_to_ensembl_df(Xin: pd.DataFrame) -> pd.DataFrame:
     cols = list(Xin.columns)
@@ -168,7 +168,7 @@ def pick_best_panel(base_cols: set[str]) -> dict:
         jacc  = inter / max(1, union)
         cand  = dict(panel=p, inter=inter, jacc=jacc, panel_size=len(fset_base))
         if (best is None or cand["jacc"] > best["jacc"] or
-           (abs(cand["jacc"] - best["jacc"]) < 1e-6 and cand["panel_size"] > best["panel_size"])):
+           (abs(cand["jacc"] - best["jacc"]) < 1e-6 and cand["panel_size"] > best["panel_size"])):  # noqa: E501
             best = cand
     if next((pp for pp in PANELS if "60k" in pp["name"]), None) and len(base_cols) >= 50000:
         best["panel"] = next(pp for pp in PANELS if "60k" in pp["name"])
@@ -177,11 +177,18 @@ def pick_best_panel(base_cols: set[str]) -> dict:
 def align_for_panel(X, panel):
     return X.reindex(columns=panel["feats"]).fillna(0.0)
 
-def run_predict(Xsym: pd.DataFrame):
+def run_predict(Xsym: pd.DataFrame, force_panel_name: str | None = None):
     X_ens = map_to_ensembl_df(Xsym)
     base_cols = {strip_ver(c) for c in X_ens.columns}
-    best = pick_best_panel(base_cols)
-    panel = best["panel"]
+
+    # Optional forced panel (used by demo to guarantee 60k)
+    if force_panel_name:
+        panel = next((p for p in PANELS if p["name"] == force_panel_name), None)
+        if panel is None:
+            raise ValueError(f"Requested panel '{force_panel_name}' not found.")
+    else:
+        panel = pick_best_panel(base_cols)["panel"]
+
     X = align_for_panel(X_ens, panel)
     proba = panel["model"].predict_proba(X)
     top1, top2, maxp, margin = top2_info(proba, panel["classes"])
@@ -230,11 +237,15 @@ with tab1:
             except Exception as e:
                 st.error(f"Prediction error: {e}")
 
-# Paste (robust)
+# Paste (header optional, robust parsing)
 with tab2:
     st.subheader("Paste data (header optional)")
     st.caption("We accept tabs/commas/spaces. First line may be gene names (symbols or ENSG...) or just values.")
-    txt = st.text_area("Paste here", height=200, placeholder="CLEC3A,HOXB13,S100A7,...\n1.23,0.45,2.10,...\n0.98,1.22,0.00,...")
+    txt = st.text_area(
+        "Paste here",
+        height=220,
+        placeholder="CLEC3A,HOXB13,S100A7,...\n1.23,0.45,2.10,...\n0.98,1.22,0.00,...",
+    )
 
     def _split_line(line:str):
         return [t for t in re.split(r"[,\t ]+", line.strip()) if t]
@@ -291,13 +302,13 @@ with tab2:
         except Exception as e:
             st.error(f"Paste parse error: {e}")
 
-# Demo (60k)
+# Demo (force 60k)
 with tab3:
     if demo_df is not None:
         st.write("Preview (first 25 genes):")
         st.dataframe(demo_df.iloc[:, :25], use_container_width=True)
 
-        # Download button (CSV)
+        # Download demo CSV (so the user can copy/paste too)
         csv_bytes = demo_df.to_csv().encode("utf-8")
         st.download_button(
             "⬇️ Download demo (60k, Ensembl IDs)",
@@ -309,7 +320,8 @@ with tab3:
 
         if st.button("🔮 Predict demo (60k)"):
             try:
-                summary, proba_df, used_panel, overlap = run_predict(demo_df)
+                # **Force the 60k panel here** so it never picks 5k.
+                summary, proba_df, used_panel, overlap = run_predict(demo_df, force_panel_name="60k_panel_legacy")
                 st.success(f"Used panel: **{used_panel}**")
                 st.info(f"Overlap with training features: {overlap['n_overlap']}/{overlap['n_total']} (coverage {overlap['coverage']:.1%})")
                 st.subheader("Results")
@@ -321,4 +333,4 @@ with tab3:
     else:
         st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
 
-st.caption("© 2025 BRCATranstypia — 5k/60k auto-detect • robust paste • demo download+predict • RAW PDF link + inline")
+st.caption("© 2025 BRCATranstypia — 5k/60k auto-detect • robust paste • demo (60k) download+predict • Web PDF link + inline")
