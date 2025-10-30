@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (Multi-panel + symbol→Ensembl mapping + clinical gating + DEMO 60k fast preview + inline guidelines link)
+# app.py — BRCATranstypia (Multi-panel, Jaccard selector, 60k demo, inline PDF link)
 
 from pathlib import Path
 import io, re
@@ -12,46 +12,28 @@ st.set_page_config(page_title="BRCATranstypia", layout="wide")
 
 # ------------------------- TITLE + HERO -------------------------
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
-
-# Link to a hosted PDF on GitHub (edit if you use a different filename/path)
-GUIDE_URL = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
-# If you also ship the PDF with the app, enable a download button:
-LOCAL_GUIDE = Path(__file__).resolve().parent / "static" / "User_Guidelines.pdf"
-
-# Hero tip
 st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
 
-# >>> CHANGE #2: put the guidelines link/button **right under** the hero tip
-guide_cols = st.columns([1, 4])
-with guide_cols[0]:
-    st.markdown("**📘 User Guidelines**")
-with guide_cols[1]:
-    if LOCAL_GUIDE.exists():
-        with open(LOCAL_GUIDE, "rb") as fh:
-            st.download_button("Open / Download PDF",
-                               data=fh.read(),
-                               file_name="User_Guidelines.pdf",
-                               mime="application/pdf",
-                               use_container_width=False)
-    else:
-        st.markdown(f"[Open / Download PDF]({GUIDE_URL})")
+# Simple inline hyperlink to the guidelines PDF (edit URL or ship a local file if you prefer)
+GUIDE_URL = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
+st.markdown(f"[📘 Open Full User Guidelines (PDF)]({GUIDE_URL})")
 
 # ====== Clinical-style reporting thresholds ======
 CONF_THRESH    = 0.85
 MARGIN_THRESH  = 0.15
 ENTROPY_THRESH = 1.40
 
-# ------------------------- SIDEBAR GUIDELINES (quick help) -------------------------
+# ------------------------- SIDEBAR QUICK HELP -------------------------
 with st.sidebar:
     st.markdown("### 🧭 User Guidelines (Quick)")
-    st.info("""
-**Input**: Rows = samples, columns = genes (symbols or Ensembl).  
-**Normalization**: TPM/log-like; quantile + z-score applied internally.  
-**Panels**: Auto-detects 5k or 60k; symbol→Ensembl mapping included.  
-**Outputs**: Subtypes *LumA, LumB, Basal, Her2, Normal* with confidence.  
-**Clinical gate**: prob ≥ 0.85, margin ≥ 0.15, entropy ≤ 1.40.  
-**Disclaimer**: Research/educational use only.
-""")
+    st.info(
+        "**Input**: Rows = samples, columns = genes (symbols or Ensembl).  \n"
+        "**Normalization**: TPM/log-like; quantile + z-score handled internally where required.  \n"
+        "**Panels**: Auto-detects 5k or 60k using Jaccard similarity; symbol→Ensembl mapping included.  \n"
+        "**Outputs**: *LumA, LumB, Basal, Her2, Normal* with confidence.  \n"
+        "**Clinical gate**: prob ≥ 0.85, margin ≥ 0.15, entropy ≤ 1.40.  \n"
+        "**Disclaimer**: Research/educational use only."
+    )
 
 # ------------------------- LOCATE PROJECT ROOT -------------------------
 def find_root(start: Path) -> Path:
@@ -82,7 +64,7 @@ PANELS_RAW = [
         name="5k_panel_svm",
         feats=ROOT / "models" / "features_panel5k.txt",
         model=ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
-        note="Quantile+LinearSVM (C=3) + Isotonic (calibrated)",
+        note="Quantile + Linear SVM (C=3) + Isotonic (calibrated)",
         expects="TPM-like scale; normalization handled internally",
         preferred=True,
     ),
@@ -140,7 +122,7 @@ ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
 # ------------------------- PARSING & ALIGNMENT -------------------------
 def parse_any_table(upload) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(upload.getvalue()))
-    # Allow column 0 to be gene id header
+    # If first column is gene header, pivot to samples×genes
     if df.columns[0].strip().lower() in {"gene", "genes", "symbol", "gene_symbol", "ensembl", "ensembl_id"}:
         df = df.set_index(df.columns[0]).T
     if df.index.name is None:
@@ -148,9 +130,9 @@ def parse_any_table(upload) -> pd.DataFrame:
     return df
 
 def map_to_ensembl_df(Xin: pd.DataFrame) -> pd.DataFrame:
-    """Accepts columns as symbols OR Ensembl; returns Ensembl (version‐stripped)."""
+    """Accept columns as symbols OR Ensembl; return Ensembl IDs (version-stripped), de-duplicated."""
     cols = list(Xin.columns)
-    # Case 1: already Ensembl → strip version and dedup
+    # Case 1: looks like Ensembl → strip version and collapse dups
     if sum(1 for c in cols if ENSEMBL_PAT.match(str(c))) / max(1, len(cols)) > 0.6:
         ensg = [strip_ver(c) for c in cols]
         sub = Xin.copy(); sub.columns = ensg
@@ -180,13 +162,27 @@ def top2_info(P: np.ndarray, classes: np.ndarray):
             P[np.arange(P.shape[0]), top1_pos],
             P[np.arange(P.shape[0]), top1_pos] - P[np.arange(P.shape[0]), top2_pos])
 
+# ---------- NEW: Jaccard-based panel selection (fixes 50k→60k vs 5k issue) ----------
 def pick_best_panel(X_cols: set[str]) -> dict:
+    """
+    Choose panel using Jaccard similarity:
+      jacc = |X ∩ panel| / |X ∪ panel|
+    Tie-breakers: larger panel wins; then 'preferred=True'.
+    """
     best = None
     for p in PANELS:
-        feats = set(p["feats"]); overlap = len(X_cols & feats)
-        ratio = overlap / max(1, len(feats))
-        cand = dict(panel=p, overlap=overlap, ratio=ratio)
-        if (best is None) or (ratio > best["ratio"]) or (ratio == best["ratio"] and p["preferred"]):
+        fset = set(p["feats"])
+        inter = len(X_cols & fset)
+        union = len(X_cols | fset)
+        jacc = inter / max(1, union)
+        cover = inter / max(1, len(fset))  # for reporting
+        cand = dict(panel=p, inter=inter, union=union, jacc=jacc, cover=cover, panel_size=len(fset))
+        if (
+            best is None
+            or cand["jacc"] > best["jacc"] + 1e-6
+            or (abs(cand["jacc"] - best["jacc"]) <= 1e-6 and cand["panel_size"] > best["panel_size"])
+            or (abs(cand["jacc"] - best["jacc"]) <= 1e-6 and cand["panel_size"] == best["panel_size"] and p.get("preferred", False))
+        ):
             best = cand
     return best
 
@@ -196,14 +192,12 @@ def align_for_panel(X, panel):
 # ------------------------- DEMO DATASET (LEGACY 60k) -------------------------
 DEMO_PATH = ROOT / "data" / "processed" / "demo_60k_ensembl.csv"
 
-# >>> CHANGE #1 (part A): cache the demo load
 @st.cache_data(show_spinner=False)
 def load_demo_df():
     if DEMO_PATH.exists():
         return pd.read_csv(DEMO_PATH, index_col=0)
     return None
 
-# Tiny, fast preview (avoid rendering 60k columns)
 def show_wide_preview(df, n_genes=25):
     small = df.iloc[:, :n_genes].copy()
     st.dataframe(small, use_container_width=True, height=260)
@@ -211,20 +205,21 @@ def show_wide_preview(df, n_genes=25):
 
 def compute_overlap_stats(mapped_cols: set[str], panel_feats: list[str]):
     fset = set(panel_feats)
-    n_total = len(panel_feats)
-    n_overlap = len(mapped_cols & fset)
-    ratio = (n_overlap / n_total) if n_total else 0.0
+    inter = len(mapped_cols & fset)
+    union = len(mapped_cols | fset)
+    cover = inter / max(1, len(fset))   # % of panel covered
+    jacc  = inter / max(1, union)       # Jaccard similarity
     missing = sorted(list(fset - mapped_cols))
-    return n_overlap, n_total, ratio, missing
+    return inter, len(fset), cover, jacc, missing
 
 def run_predict(Xsym: pd.DataFrame):
-    # Map to Ensembl & pick panel
+    # Map to Ensembl & pick best panel by Jaccard
     X_ens = map_to_ensembl_df(Xsym)
     best = pick_best_panel(set(X_ens.columns))
     panel = best["panel"]
 
     # Overlap report (before alignment)
-    n_overlap, n_total, ratio, missing = compute_overlap_stats(set(X_ens.columns), panel["feats"])
+    n_overlap, n_total, cover, jacc, missing = compute_overlap_stats(set(X_ens.columns), panel["feats"])
 
     # Align, predict, compute confidence
     X = align_for_panel(X_ens, panel)
@@ -239,7 +234,11 @@ def run_predict(Xsym: pd.DataFrame):
         "entropy_bits": ent, "confident_call": conf_ok
     }, index=X.index)
 
-    overlap = dict(n_overlap=n_overlap, n_total=n_total, ratio=ratio, missing=missing, panel_name=panel["name"])
+    overlap = dict(
+        n_overlap=n_overlap, n_total=n_total,
+        coverage=cover, jaccard=jacc,
+        missing=missing, panel_name=panel["name"]
+    )
     return summary, pd.DataFrame(proba, columns=panel["classes"], index=X.index), panel["name"], overlap
 
 # ------------------------- MAIN UI -------------------------
@@ -256,7 +255,10 @@ with tab1:
             raw = parse_any_table(up)
             summary, proba_df, used_panel, overlap = run_predict(raw)
             st.success(f"Used panel: **{used_panel}**")
-            st.info(f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** ({overlap['ratio']:.1%}).")
+            st.info(
+                f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** "
+                f"(coverage {overlap['coverage']:.1%}, Jaccard {overlap['jaccard']:.1%})."
+            )
             with st.expander("Show missing training features (if any)", expanded=False):
                 if overlap["missing"]:
                     st.write(", ".join(overlap["missing"][:200]) + (" …" if len(overlap["missing"]) > 200 else ""))
@@ -303,7 +305,10 @@ with tab2:
             df_user = pd.DataFrame(values, columns=genes, index=[f"sample_{i+1}" for i in range(len(values))])
             summary, proba_df, used_panel, overlap = run_predict(df_user)
             st.success(f"Used panel: **{used_panel}**")
-            st.info(f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** ({overlap['ratio']:.1%}).")
+            st.info(
+                f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** "
+                f"(coverage {overlap['coverage']:.1%}, Jaccard {overlap['jaccard']:.1%})."
+            )
             with st.expander("Show missing training features (if any)", expanded=False):
                 if overlap["missing"]:
                     st.write(", ".join(overlap["missing"][:200]) + (" …" if len(overlap["missing"]) > 200 else ""))
@@ -320,16 +325,18 @@ with tab3:
         st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
     else:
         st.caption("Small TCGA-BRCA subset (Ensembl IDs; aligned to legacy 60k panel).")
-        # >>> CHANGE #1 (part B): tiny preview instead of rendering 60k columns
+        # Tiny, fast preview (avoid rendering 60k columns)
         show_wide_preview(demo_df, n_genes=25)
-
         colA, colB = st.columns([1,1])
         with colA:
             if st.button("🔮 Predict on demo (60k)"):
                 try:
                     summary, proba_df, used_panel, overlap = run_predict(demo_df)
                     st.success(f"Used panel: **{used_panel}**")
-                    st.info(f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** ({overlap['ratio']:.1%}).")
+                    st.info(
+                        f"Overlap with training features: **{overlap['n_overlap']}/{overlap['n_total']}** "
+                        f"(coverage {overlap['coverage']:.1%}, Jaccard {overlap['jaccard']:.1%})."
+                    )
                     st.dataframe(summary, use_container_width=True)
                 except Exception as e:
                     st.exception(e)
@@ -337,6 +344,4 @@ with tab3:
             st.download_button("⬇️ Download demo CSV (60k)", data=demo_df.to_csv().encode(),
                                file_name="demo_60k_ensembl.csv", mime="text/csv")
 
-st.caption("© 2025 BRCATranstypia | Quantile-calibrated SVM • Legacy 60k support • Multi-panel • Ensembl mapping • Clinical gating • Overlap reporting")
-
-
+st.caption("© 2025 BRCATranstypia | Jaccard auto-detect • Quantile-calibrated SVM • Legacy 60k support • Ensembl mapping • Clinical gating")
