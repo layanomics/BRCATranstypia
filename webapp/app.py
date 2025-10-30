@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (Multi-panel auto-detect + symbol→Ensembl mapping + clinical gating)
+# app.py — BRCATranstypia (Multi-panel auto-detect + symbol→Ensembl mapping + clinical gating + user guidelines)
 
 from pathlib import Path
 import io, re
@@ -7,15 +7,16 @@ import pandas as pd
 import streamlit as st
 import joblib
 
+# ------------------------- PAGE CONFIG -------------------------
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 
 # ====== Clinical-style reporting thresholds ======
-CONF_THRESH    = 0.85   # minimum top1 probability
-MARGIN_THRESH  = 0.15   # top1 - top2 separation
-ENTROPY_THRESH = 1.40   # max Shannon entropy (bits)
+CONF_THRESH    = 0.85
+MARGIN_THRESH  = 0.15
+ENTROPY_THRESH = 1.40
 
-# ---------- locate project root ----------
+# ------------------------- LOCATE PROJECT ROOT -------------------------
 def find_root(start: Path) -> Path:
     p = start.resolve()
     for _ in range(8):
@@ -27,7 +28,7 @@ def find_root(start: Path) -> Path:
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 
-# ---------- panels registry (only panels whose files exist will be loaded) ----------
+# ------------------------- PANEL REGISTRY -------------------------
 def strip_ver(s: str) -> str:
     return str(s).split(".")[0]
 
@@ -41,66 +42,52 @@ def read_feats(p: Path) -> list[str]:
     return out
 
 PANELS_RAW = [
-    # 5k calibrated SVM (best external confidence ~0.824)
     dict(
         name="5k_panel_svm",
         feats=ROOT / "models" / "features_panel5k.txt",
         model=ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
-        note="Quantile+Standardize+LinearSVM (C=3) + Isotonic (calibrated)",
-        expects="TPM-like; normalization inside the pipeline",
-        cols_idx_key="cols_idx",
-        preferred=True,   # prefer 5k when overlap ties
+        note="Quantile+LinearSVM (C=3) + Isotonic (calibrated)",
+        expects="TPM-like scale; normalization handled internally",
+        preferred=True,
     ),
-    # Optional: 60k legacy model (if present, app will use it when overlap is higher)
     dict(
         name="60k_panel_legacy",
         feats=ROOT / "models" / "features.txt",
         model=ROOT / "models" / "model.joblib",
-        note="Legacy 60k model",
-        expects="Training-like scale (no quantile step in pipeline)",
-        cols_idx_key=None,
+        note="Legacy 60k model (GDC baseline)",
+        expects="Training-like scale (no quantile step)",
         preferred=False,
     ),
 ]
 
-# Build runtime panel list
 PANELS = []
 for cfg in PANELS_RAW:
     try:
         if cfg["feats"].exists() and cfg["model"].exists():
             feats = read_feats(cfg["feats"])
             payload = joblib.load(cfg["model"])
-            # payload can be a model OR a dict {"model":..., "cols_idx":...}
             if isinstance(payload, dict) and "model" in payload:
                 model = payload["model"]
-                cols_idx = payload.get(cfg["cols_idx_key"] or "cols_idx", None)
             else:
                 model = payload
-                cols_idx = None
             classes = np.array(getattr(model, "classes_", []))
             PANELS.append(dict(
                 name=cfg["name"], feats=feats, model=model, classes=classes,
-                note=cfg["note"], expects=cfg["expects"], cols_idx=cols_idx,
-                preferred=cfg.get("preferred", False)
+                note=cfg["note"], expects=cfg["expects"], preferred=cfg["preferred"]
             ))
     except Exception:
-        # Skip broken/missing panels silently
         pass
 
 if not PANELS:
-    st.error("No panels available. Ensure models and feature files exist under ./models/")
+    st.error("❌ No panels found in ./models/. Please upload trained models first.")
     st.stop()
 
-# ---------- symbol → ensembl map (with aliases) ----------
+# ------------------------- SYMBOL → ENSEMBL MAP -------------------------
 @st.cache_resource
 def build_symbol_to_ensembl():
     id_map = ROOT / "models" / "id_map.csv"
-    if not id_map.exists():
-        raise FileNotFoundError("models/id_map.csv not found.")
     df = pd.read_csv(id_map)
     df.columns = [c.lower() for c in df.columns]
-    if "ensembl_id" not in df.columns or "symbol" not in df.columns:
-        raise ValueError("id_map.csv must have columns: symbol, ensembl_id [, aliases]")
     df["ensg"] = df["ensembl_id"].astype(str).str.split(".").str[0]
 
     rows = [(str(r["symbol"]).upper(), r["ensg"]) for _, r in df.iterrows()]
@@ -117,14 +104,9 @@ def build_symbol_to_ensembl():
 
 SYM2ENS = build_symbol_to_ensembl()
 
-# ---------- helpers ----------
+# ------------------------- HELPERS -------------------------
 def parse_any_table(upload) -> pd.DataFrame:
-    raw = upload.getvalue()
-    b = io.BytesIO(raw)
-    df = pd.read_csv(b)
-    if not isinstance(df, pd.DataFrame) or df.shape[1] < 2:
-        raise ValueError("Unrecognized CSV. Expect samples × genes or a 'Gene' first column.")
-    # If first column looks like gene column, transpose
+    df = pd.read_csv(io.BytesIO(upload.getvalue()))
     if df.columns[0].strip().lower() in {"gene", "genes", "symbol", "gene_symbol"}:
         df = df.set_index(df.columns[0]).T
     if df.index.name is None:
@@ -132,22 +114,17 @@ def parse_any_table(upload) -> pd.DataFrame:
     return df
 
 def map_symbols_to_ensembl_df(Xsym: pd.DataFrame) -> pd.DataFrame:
-    # Map *columns* (genes) to Ensembl; collapse dup ENSGs by mean
     mapped_cols = []
     for c in Xsym.columns:
         ensg = SYM2ENS.get(str(c).upper())
         if ensg:
             mapped_cols.append((c, ensg))
-    if not mapped_cols:
-        raise ValueError("No columns mapped to Ensembl IDs. Update models/id_map.csv with more aliases.")
     sub = Xsym[[c for c, _ in mapped_cols]].copy()
     sub.columns = [e for _, e in mapped_cols]
-    sub = sub.T.groupby(level=0).mean().T
-    return sub
+    return sub.T.groupby(level=0).mean().T
 
 def entropy_bits(P: np.ndarray) -> np.ndarray:
     P = np.clip(P, 1e-12, 1.0)
-    P = P / P.sum(axis=1, keepdims=True)
     return (-(P * np.log2(P))).sum(axis=1)
 
 def top2_info(P: np.ndarray, classes: np.ndarray):
@@ -155,207 +132,136 @@ def top2_info(P: np.ndarray, classes: np.ndarray):
     row_max_is_second = P[np.arange(P.shape[0])[:, None], top2_idx].argmax(axis=1)
     top1_pos = top2_idx[np.arange(P.shape[0]), row_max_is_second]
     top2_pos = top2_idx[np.arange(P.shape[0]), 1 - row_max_is_second]
-    maxp = P[np.arange(P.shape[0]), top1_pos]
-    second = P[np.arange(P.shape[0]), top2_pos]
-    margin = maxp - second
-    top1 = classes[top1_pos]
-    top2 = classes[top2_pos]
-    return top1, top2, maxp, margin
+    return classes[top1_pos], classes[top2_pos], P[np.arange(P.shape[0]), top1_pos], P[np.arange(P.shape[0]), top1_pos] - P[np.arange(P.shape[0]), top2_pos]
 
-def pick_best_panel(X_ens_cols: set[str]) -> dict:
-    """Pick the panel with the highest overlap ratio; break ties by 'preferred' flag."""
+def pick_best_panel(X_cols: set[str]) -> dict:
     best = None
     for p in PANELS:
         feats = set(p["feats"])
-        overlap = len(X_ens_cols & feats)
+        overlap = len(X_cols & feats)
         ratio = overlap / max(1, len(feats))
         cand = dict(panel=p, overlap=overlap, ratio=ratio)
-        if (best is None) or (ratio > best["ratio"]) or (ratio == best["ratio"] and p["preferred"] and not best["panel"]["preferred"]):
+        if (best is None) or (ratio > best["ratio"]) or (ratio == best["ratio"] and p["preferred"]):
             best = cand
     return best
 
-def align_for_panel(X_ens: pd.DataFrame, panel: dict) -> pd.DataFrame:
-    # align to the panel's features; missing → 0.0
-    X = X_ens.reindex(columns=panel["feats"]).fillna(0.0).astype(float)
-    # if panel was trained with a column subset, apply it
-    if panel.get("cols_idx") is not None:
-        X = X.iloc[:, panel["cols_idx"]]
-    return X
+def align_for_panel(X, panel):
+    return X.reindex(columns=panel["feats"]).fillna(0.0)
 
-# ---------- UI ----------
-tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
+# ------------------------- MAIN UI -------------------------
+tab1, tab2 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel"])
 
+# ===== Tab 1 — Upload =====
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
-    st.caption("Columns = gene symbols (HGNC). Rows = samples. If first column is Gene/Symbol, we auto-transpose.")
+    st.caption("Columns = gene symbols (HGNC). Rows = samples.")
 
-    if "upload_result" not in st.session_state:
-        st.session_state.upload_result = None
-
-    with st.form("upload_form", clear_on_submit=False):
-        up = st.file_uploader("Choose a CSV file", type=["csv"], key="uploader_csv")
-        submitted = st.form_submit_button("🔮 Predict")
-
-    if submitted and up is not None:
+    up = st.file_uploader("Choose a CSV file", type=["csv"])
+    if up and st.button("🔮 Predict"):
         try:
             raw = parse_any_table(up)
             X_ens = map_symbols_to_ensembl_df(raw)
-
             best = pick_best_panel(set(X_ens.columns))
             panel = best["panel"]
             X = align_for_panel(X_ens, panel)
-
             proba = panel["model"].predict_proba(X)
             top1, top2, maxp, margin = top2_info(proba, panel["classes"])
             ent = entropy_bits(proba)
             conf_ok = (maxp >= CONF_THRESH) & (margin >= MARGIN_THRESH) & (ent <= ENTROPY_THRESH)
-
-            df_preds = pd.DataFrame(proba, columns=panel["classes"], index=X.index)
             summary = pd.DataFrame({
-                "predicted_subtype": top1,
-                "second_best": top2,
-                "top2_margin": margin,
-                "max_prob": maxp,
-                "entropy_bits": ent,
-                "confident_call": conf_ok
+                "predicted_subtype": top1, "second_best": top2,
+                "top2_margin": margin, "max_prob": maxp,
+                "entropy_bits": ent, "confident_call": conf_ok
             }, index=X.index)
-
-            st.session_state.upload_result = {
-                "panel_name": panel["name"],
-                "panel_note": panel["note"],
-                "overlap": best["overlap"],
-                "n_features": len(panel["feats"]),
-                "ratio": best["ratio"],
-                "mean_conf": float(np.mean(maxp)),
-                "low_count": int((~conf_ok).sum()),
-                "df_preds": df_preds,
-                "summary": summary,
-            }
+            st.dataframe(summary, use_container_width=True)
         except Exception as e:
-            st.session_state.upload_result = {"error": e}
+            st.exception(e)
 
-    res = st.session_state.upload_result
-    if res:
-        if "error" in res and res["error"] is not None:
-            st.exception(res["error"])
-        else:
-            st.caption(
-                f"Panel: **{res['panel_name']}** • {res['panel_note']}  \n"
-                f"Overlap: {res['overlap']}/{res['n_features']} "
-                f"({res['ratio']*100:.1f}%) • Mean confidence: {res['mean_conf']:.3f}  \n"
-                f"Thresholds → prob≥{CONF_THRESH}, margin≥{MARGIN_THRESH}, entropy≤{ENTROPY_THRESH}"
-            )
-            if res["ratio"] < 0.6:
-                st.warning("⚠️ Feature overlap < 60%. Predictions may be less reliable.")
-            if res["low_count"] > 0:
-                st.info(f"ℹ️ {res['low_count']} sample(s) flagged as Indeterminate.")
-
-            st.subheader("Predicted probabilities")
-            st.dataframe(res["df_preds"].style.format("{:.3f}"), use_container_width=True)
-
-            st.subheader("Summary (Top-2, margin, confidence gates)")
-            st.dataframe(
-                res["summary"][["predicted_subtype","second_best","top2_margin","max_prob","entropy_bits","confident_call"]]
-                .style.format({"top2_margin":"{:.3f}","max_prob":"{:.3f}","entropy_bits":"{:.3f}"}),
-                use_container_width=True
-            )
-
-            csv_bytes = res["summary"].join(res["df_preds"]).to_csv(index=True).encode("utf-8")
-            st.download_button("📥 Download predictions (CSV)", data=csv_bytes,
-                               file_name="predictions_calibrated_multi_panel.csv", mime="text/csv")
-
+# ===== Tab 2 — Paste =====
 with tab2:
-    st.subheader("Paste from Excel (header + one or more rows)")
-    st.caption("You can paste directly from Excel. We accept tabs, commas, or spaces between values.")
+    st.subheader("Paste from Excel (header optional)")
+    st.caption("You can paste directly from Excel — we accept tabs, commas, or spaces.")
 
-    example_feats = PANELS[0]["feats"][:12]
-    preview_genes = "\t".join(example_feats)
-    preview_vals1 = "\t".join(["0"] * len(example_feats))
-    preview_vals2 = "\t".join(["0.1"] * len(example_feats))
-    demo = preview_genes + "\n" + preview_vals1 + "\n" + preview_vals2
-
-    txt = st.text_area("Paste here", value=demo, height=180)
-
+    txt = st.text_area("Paste here", height=180)
     if st.button("Predict (from paste)"):
         try:
-            import re
-
-            # 1) split into non-empty lines
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
-            if len(lines) < 2:
-                raise ValueError("Provide a header line (genes) followed by one or more data lines.")
+            if not lines:
+                raise ValueError("Please paste at least one line of values.")
 
-            # 2) split header into genes (tabs/commas/spaces all OK)
+            def is_numeric_line(line):
+                toks = re.split(r"[,\t ]+", line.strip())
+                nums = 0
+                for t in toks:
+                    try:
+                        float(t)
+                        nums += 1
+                    except ValueError:
+                        pass
+                return nums > 0 and nums / len(toks) > 0.7
+
             header = re.split(r"[,\t ]+", lines[0].strip())
-            genes = [g for g in header if g]
-            if len(genes) == 0:
-                raise ValueError("No genes detected in the first line.")
+            has_header = not is_numeric_line(lines[0])
 
-            # 3) parse each data row, ensuring the same number of columns
+            if has_header:
+                genes = [g for g in header if g]
+                value_lines = lines[1:]
+            else:
+                panel_default = PANELS[0]
+                genes = panel_default["feats"][: len(header)]
+                value_lines = lines
+
             values = []
-            for i, row in enumerate(lines[1:], start=1):
+            for row in value_lines:
                 toks = [t for t in re.split(r"[,\t ]+", row.strip()) if t]
-                if len(toks) != len(genes):
-                    raise ValueError(f"Row {i} has {len(toks)} values but header has {len(genes)} genes.")
-                try:
-                    values.append([float(t) for t in toks])
-                except ValueError:
-                    raise ValueError(f"Row {i} contains non-numeric values. Make sure numbers use a dot as decimal.")
+                values.append([float(t) for t in toks])
 
-            # 4) build DataFrame: samples x genes
-            idx = [f"sample_{i}" for i in range(1, len(values) + 1)]
-            df_user = pd.DataFrame(values, columns=genes, index=idx)
-
-            # 5) map symbols -> Ensembl, pick panel, align, predict (same as upload flow)
+            df_user = pd.DataFrame(values, columns=genes, index=[f"sample_{i+1}" for i in range(len(values))])
             X_ens = map_symbols_to_ensembl_df(df_user)
             best = pick_best_panel(set(X_ens.columns))
             panel = best["panel"]
             X = align_for_panel(X_ens, panel)
-
             proba = panel["model"].predict_proba(X)
             top1, top2, maxp, margin = top2_info(proba, panel["classes"])
             ent = entropy_bits(proba)
             conf_ok = (maxp >= CONF_THRESH) & (margin >= MARGIN_THRESH) & (ent <= ENTROPY_THRESH)
-
-            df_preds = pd.DataFrame(proba, columns=panel["classes"], index=X.index)
             summary = pd.DataFrame({
-                "predicted_subtype": top1,
-                "second_best": top2,
-                "top2_margin": margin,
-                "max_prob": maxp,
-                "entropy_bits": ent,
-                "confident_call": conf_ok
+                "predicted_subtype": top1, "second_best": top2,
+                "top2_margin": margin, "max_prob": maxp,
+                "entropy_bits": ent, "confident_call": conf_ok
             }, index=X.index)
-
-            st.caption(
-                f"Panel: **{panel['name']}** • overlap {best['overlap']}/{len(panel['feats'])} "
-                f"({best['ratio']*100:.1f}%) • Mean confidence: {float(np.mean(maxp)):.3f}  \n"
-                f"Thresholds → prob≥{CONF_THRESH}, margin≥{MARGIN_THRESH}, entropy≤{ENTROPY_THRESH}"
-            )
-            if best["ratio"] < 0.6:
-                st.warning("⚠️ Feature overlap < 60%. Predictions may be less reliable.")
-            if (~conf_ok).sum() > 0:
-                st.info(f"ℹ️ {(~conf_ok).sum()} sample(s) flagged as Indeterminate.")
-
-            st.subheader("Predicted probabilities")
-            st.dataframe(df_preds.style.format("{:.3f}"), use_container_width=True)
-
-            st.subheader("Summary (Top-2, margin, confidence gates)")
-            st.dataframe(
-                summary[["predicted_subtype","second_best","top2_margin","max_prob","entropy_bits","confident_call"]]
-                .style.format({"top2_margin":"{:.3f}","max_prob":"{:.3f}","entropy_bits":"{:.3f}"}),
-                use_container_width=True
-            )
-
-            csv_bytes = summary.join(df_preds).to_csv(index=True).encode("utf-8")
-            st.download_button("📥 Download predictions (CSV)", data=csv_bytes,
-                               file_name="predictions_from_paste.csv", mime="text/csv")
-
+            st.dataframe(summary, use_container_width=True)
         except Exception as e:
             st.exception(e)
 
+# ------------------------- USER GUIDELINES -------------------------
+with st.expander("📘 User Guidelines for Clinical/Research Use", expanded=False):
+    st.markdown("""
+    ### 🧬 Guidelines for Using the Transcriptomic Subtype Prediction Model
 
-st.divider()
-st.caption("Methods: Multi-panel auto-detect • symbol→Ensembl mapping (aliases via models/id_map.csv) • "
-           "Reference quantile/standardization + calibration inside model • "
-           "Clinical gating (probability/margin/entropy) with Indeterminate fallback.")
+    **1. Input format**
+    - Accepts tabular data with gene symbols or Ensembl IDs.  
+    - Rows represent **samples**, columns represent **gene expression values**.  
+    - Supports both **CSV upload** and **Excel-style paste**.
+
+    **2. Data normalization**
+    - Input should be *TPM-like* or *normalized log expression* (not raw counts).  
+    - The model internally applies quantile and z-normalization steps.
+
+    **3. Model selection**
+    - Automatically detects the most compatible gene panel (5k vs. 60k).  
+    - Uses symbol → Ensembl mapping for flexibility.
+
+    **4. Interpretation**
+    - Displays predicted subtypes: *LumA, LumB, Basal, Her2, Normal*.  
+    - Confidence gating thresholds are applied:  
+      `prob ≥ 0.85`, `margin ≥ 0.15`, `entropy ≤ 1.40`.  
+      Samples failing these are flagged as *Indeterminate*.
+
+    **5. Disclaimer**
+    - This tool is for research and educational purposes only.  
+    - Clinical decisions should rely on validated assays and expert review.
+    """)
+
+st.caption("© 2025 BRCATranstypia | Quantile-calibrated SVM • Multi-panel • Ensembl mapping • Clinical gating")
+
