@@ -1,13 +1,14 @@
-# app.py — BRCA subtype predictor (fixed: pass DataFrame to predict_proba)
+# app.py — BRCATranstypia (calibrated 5k pipeline, symbol→Ensembl mapping, clinical confidence flags)
+
 from pathlib import Path
-import json, io, re
+import io, json, re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
 
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
-st.title("🧬 BRCATranstypia — BRCA Subtype Predictor")
+st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Calibrated 5k)")
 
 # ---------- locate project root ----------
 def find_root(start: Path) -> Path:
@@ -21,228 +22,215 @@ def find_root(start: Path) -> Path:
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 
-# ---------- model bundles ----------
-BIG = {
-    "model": ROOT / "models" / "model.joblib",
-    "feats": ROOT / "models" / "features.txt",
-    "classes": ROOT / "models" / "classes.json",
-    "stats": ROOT / "models" / "feature_stats.npz",
-    "name": "full-60k"
-}
-SMALL = {
-    "model": ROOT / "models" / "model_panel5k.joblib",
-    "feats": ROOT / "models" / "features_panel5k.txt",
-    "classes": ROOT / "models" / "classes_panel5k.json",
-    "stats": ROOT / "models" / "feature_stats_panel5k.npz",
-    "name": "panel-5k"
-}
-ID_MAP_PATH = ROOT / "models" / "id_map.csv"
+# ---------- paths (calibrated 5k only) ----------
+MODEL_PATH = ROOT / "models" / "model_panel5k_quantile_lr_isotonic.joblib"
+FEATS_PATH = ROOT / "models" / "features_panel5k.txt"         # training feature order (Ensembl, may be versioned in file; we strip)
+ID_MAP_PATH = ROOT / "models" / "id_map.csv"                  # columns: symbol, ensembl_id, aliases (optional)
 
-# ---------- helper for aligning stats ----------
-def _align_stats_to_feats(mu, sd, feats_stats, feats):
-    if mu is None or sd is None or feats_stats is None:
-        return None, None
-    pos = {name: i for i, name in enumerate(feats_stats)}
-    mu2 = np.zeros(len(feats), dtype="float32")
-    sd2 = np.ones(len(feats), dtype="float32")
-    for j, name in enumerate(feats):
-        i = pos.get(name)
-        if i is not None:
-            sd_safe = sd[i] if sd[i] != 0 else 1.0
-            mu2[j] = float(mu[i])
-            sd2[j] = float(sd_safe)
-    return mu2, sd2
+# ---------- helpers ----------
+def strip_ver(s: str) -> str:
+    return str(s).split(".")[0]
 
-# ---------- load model ----------
-@st.cache_resource
-def load_bundle(bundle):
-    model = joblib.load(bundle["model"])
-    feats = [ln.strip() for ln in Path(bundle["feats"]).read_text(encoding="utf-8").splitlines() if ln.strip()]
-    if Path(bundle["classes"]).exists():
-        classes = json.loads(Path(bundle["classes"]).read_text())
-    else:
-        classes = list(getattr(model, "classes_", []))
-
-    mu = sd = feats_stats = None
-    if Path(bundle["stats"]).exists():
-        z = np.load(bundle["stats"], allow_pickle=False)
-        mu_raw, sd_raw, feats_stats = z["mean"], z["std"], list(z["features"])
-        mu, sd = _align_stats_to_feats(mu_raw, sd_raw, feats_stats, feats)
-
-    return model, feats, classes, mu, sd
-
-model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG   = load_bundle(BIG)
-model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL = load_bundle(SMALL)
-
-# ---------- load ID map ----------
-id_map = pd.read_csv(ID_MAP_PATH)
-id_map.columns = [c.lower() for c in id_map.columns]
-id_map["ensembl"] = id_map["ensembl"].astype(str).str.upper().str.replace(r"\.\d+$", "", regex=True)
-id_map["symbol"] = id_map["symbol"].astype(str).str.upper()
-SYM2ENS = dict(zip(id_map["symbol"], id_map["ensembl"]))
-ENS2SYM = dict(zip(id_map["ensembl"], id_map["symbol"]))
-
-# ---------- gene helpers ----------
-ENSEMBL_RE = re.compile(r"^ENSG\d+", re.I)
-
-def norm_gene(x: str) -> str:
-    s = str(x).strip().split("|", 1)[0].replace("_", "-").upper()
-    if s.startswith("ENSG"):
-        s = s.split(".")[0]
-    return s
-
-def build_unver_to_exact(feats: list[str]) -> dict[str, str]:
-    m = {}
-    for f in feats:
-        fu = f.split(".")[0].upper() if f.upper().startswith("ENSG") else f
-        m[fu] = f
-    return m
-
-def map_cols_to_bundle(cols: list[str], feats: list[str]) -> pd.Index:
-    UNVER2EXACT = build_unver_to_exact(feats)
+def read_feats(path: Path) -> list[str]:
+    """Read 5k training features, strip versions, preserve order, dedupe."""
+    seen = set()
     out = []
-    for c in cols:
-        n = norm_gene(c)
-        if n.startswith("ENSG"):
-            exact = n if n in feats else UNVER2EXACT.get(n.split(".")[0], n)
-        else:
-            ens_unv = SYM2ENS.get(n, n)
-            exact = UNVER2EXACT.get(ens_unv, ens_unv)
-        out.append(exact)
-    return pd.Index(out)
+    for ln in path.read_text(encoding="utf-8").splitlines():
+        x = ln.strip()
+        if not x:
+            continue
+        x = strip_ver(x)
+        if x not in seen:
+            seen.add(x)
+            out.append(x)
+    return out
+
+@st.cache_resource
+def load_model_and_classes():
+    model = joblib.load(MODEL_PATH)
+    classes = list(getattr(model, "classes_", []))
+    feats_5k = read_feats(FEATS_PATH)
+    return model, classes, feats_5k
+
+model, CLASSES, FEATS_5K = load_model_and_classes()
+
+# --- build HGNC symbol → Ensembl (stripped) map (with aliases) ---
+@st.cache_resource
+def build_symbol_to_ensembl():
+    df = pd.read_csv(ID_MAP_PATH)
+    df.columns = [c.lower() for c in df.columns]
+    if "ensembl_id" not in df.columns or "symbol" not in df.columns:
+        raise ValueError("models/id_map.csv must have columns: symbol, ensembl_id [, aliases]")
+    df["ensg"] = df["ensembl_id"].astype(str).str.split(".").str[0]
+    df["symbol_u"] = df["symbol"].astype(str).str.upper()
+
+    rows = [(df.loc[i, "symbol_u"], df.loc[i, "ensg"]) for i in df.index]
+    if "aliases" in df.columns:
+        for _, r in df.iterrows():
+            for a in re.split(r"[|,;]", str(r.get("aliases", "") or "")):
+                a = a.strip().upper()
+                if a:
+                    rows.append((a, r["ensg"]))
+
+    sym2ens = {}
+    for k, v in rows:
+        # keep the first mapping encountered (deterministic)
+        sym2ens.setdefault(k, v)
+    return sym2ens
+
+SYM2ENS = build_symbol_to_ensembl()
 
 def parse_any_table(upload) -> pd.DataFrame:
+    """Accept CSV: samples×genes or genes×samples (if first col is gene)."""
     raw = upload.getvalue()
-    b1 = io.BytesIO(raw)
-    try:
-        df = pd.read_csv(b1)
-        if isinstance(df, pd.DataFrame) and df.shape[1] >= 2:
-            return df
-    except Exception:
-        pass
-    raise ValueError("Unrecognized file format. Please upload a CSV (samples×genes).")
-
-def align_to_features(df: pd.DataFrame, features_norm: list[str]) -> pd.DataFrame:
-    if df.columns[0].lower() in {"gene", "genes", "symbol", "gene_symbol"}:
+    b = io.BytesIO(raw)
+    df = pd.read_csv(b)
+    if not isinstance(df, pd.DataFrame) or df.shape[1] < 2:
+        raise ValueError("Unrecognized file format. Please upload a CSV.")
+    # genes in first column? transpose to samples×genes
+    if df.columns[0].strip().lower() in {"gene", "genes", "symbol", "gene_symbol"}:
         df = df.set_index(df.columns[0]).T
-    out = df.copy()
-    for f in features_norm:
-        if f not in out.columns:
-            out[f] = np.nan
-    out = out[features_norm].apply(pd.to_numeric, errors="coerce").fillna(0.0)
-    return out
+    # ensure index exists
+    if df.index.name is None:
+        df.index.name = "sample"
+    return df
+
+def map_symbols_to_ensembl_df(Xsym: pd.DataFrame) -> pd.DataFrame:
+    """Map HGNC symbol columns -> Ensembl (stripped). Collapse duplicates by mean."""
+    mapped = []
+    for c in Xsym.columns:
+        ensg = SYM2ENS.get(str(c).upper())
+        if ensg is not None:
+            mapped.append((c, ensg))
+    if not mapped:
+        raise ValueError("No columns mapped to Ensembl. Update models/id_map.csv with needed aliases.")
+
+    sub = Xsym[[c for c, _ in mapped]].copy()
+    sub.columns = [e for _, e in mapped]  # rename to Ensembl
+    # collapse duplicates (same ENSG) by mean
+    sub = sub.T.groupby(level=0).mean().T
+    return sub
+
+def align_to_training_features(X_ens: pd.DataFrame, feats_5k: list[str]) -> pd.DataFrame:
+    """Align to the exact 5k training feature list; fill missing with 0.0."""
+    X = X_ens.reindex(columns=feats_5k).fillna(0.0).astype(float)
+    return X
+
+def entropy_bits(P: np.ndarray) -> np.ndarray:
+    P = np.clip(P, 1e-12, 1.0)
+    P = P / P.sum(axis=1, keepdims=True)
+    return (-(P * np.log2(P))).sum(axis=1)
+
+def top2_margin(P: np.ndarray) -> np.ndarray:
+    # difference between top-1 and top-2
+    top2 = np.partition(P, -2, axis=1)[:, -2:]
+    return top2[:, 1] - top2[:, 0]
 
 # ---------- UI ----------
 tab1, tab2 = st.tabs(["📤 Upload CSV", "📝 Paste one sample"])
 
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
+    st.caption("Columns = gene symbols (HGNC). Rows = samples. If your first column is named Gene/Symbol, we auto-transpose.")
     up = st.file_uploader("Choose a CSV file", type=["csv"])
     if up is not None:
         try:
             raw = parse_any_table(up)
-            normed_cols = [norm_gene(c) for c in raw.columns]
-            mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
-            mapped_big   = map_cols_to_bundle(normed_cols, FEATS_BIG)
-            ov_small = len(set(mapped_small) & set(FEATS_SMALL))
-            ov_big   = len(set(mapped_big)   & set(FEATS_BIG))
 
-            if ov_small >= ov_big:
-                model_name, mdl, FEATS, CLASSES, MU, SD = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL)
-                raw.columns = mapped_small
-            else:
-                model_name, mdl, FEATS, CLASSES, MU, SD = ("full-60k",  model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG)
-                raw.columns = mapped_big
+            # Map symbols → Ensembl (stripped) and align to 5k panel
+            X_ens = map_symbols_to_ensembl_df(raw)
+            overlap = len(set(X_ens.columns) & set(FEATS_5K))
+            X = align_to_training_features(X_ens, FEATS_5K)
 
-            overlap = len(set(raw.columns) & set(FEATS))
-            X = align_to_features(raw, FEATS)
+            # Calibrated pipeline: quantile + scaling + logistic + isotonic (trained on TCGA)
+            proba = model.predict_proba(X)
+            classes = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
 
-            if MU is not None and SD is not None and len(MU) == X.shape[1]:
-                Xv = (X.values - MU) / SD
-            else:
-                mu_local = X.mean(axis=0).values
-                sd_local = X.std(axis=0).values
-                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
-                Xv = (X.values - mu_local) / sd_local
+            # Confidence metrics
+            maxp = proba.max(axis=1)
+            margin = top2_margin(proba)
+            ent = entropy_bits(proba)
+            conf_ok = (maxp >= 0.70) & (margin >= 0.20) & (ent <= 1.2)
 
-            # --- NEW: keep feature names when predicting ---
-            Xv_df = pd.DataFrame(Xv, columns=FEATS, index=X.index)
-            proba = mdl.predict_proba(Xv_df)
+            preds = classes[np.argmax(proba, axis=1)]
+            df_preds = pd.DataFrame(proba, columns=classes, index=X.index)
+            out = pd.DataFrame({
+                "predicted_subtype": preds,
+                "max_prob": maxp,
+                "top2_margin": margin,
+                "entropy_bits": ent,
+                "confident_call": conf_ok
+            }, index=X.index).join(df_preds)
 
-            cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
-            preds = pd.DataFrame(proba, columns=cols, index=X.index)
-            conf = preds.max(axis=1)
-            st.caption(f"Model: {model_name} • Overlap: {overlap}/{len(FEATS)} ({overlap/len(FEATS)*100:.1f}%) • Mean confidence: {conf.mean():.2f}")
+            st.caption(f"Overlap with 5k panel: {overlap}/{len(FEATS_5K)} ({overlap/len(FEATS_5K)*100:.1f}%) • Mean confidence: {maxp.mean():.3f}")
             st.subheader("Predicted probabilities")
-            st.dataframe(preds.style.format({c:"{:.3f}" for c in cols}), use_container_width=True)
+            st.dataframe(df_preds.style.format({c: "{:.3f}" for c in classes}), use_container_width=True)
 
-            top = preds.idxmax(axis=1).rename("predicted_subtype")
-            out = pd.concat([top, conf.rename("confidence"), preds], axis=1)
+            # Summary table with flags
+            st.subheader("Summary (with clinical confidence flags)")
+            st.dataframe(out[["predicted_subtype","max_prob","top2_margin","entropy_bits","confident_call"]]
+                         .style.format({"max_prob":"{:.3f}","top2_margin":"{:.3f}","entropy_bits":"{:.3f}"}),
+                         use_container_width=True)
+
+            # Download
             csv_bytes = out.to_csv(index=True).encode("utf-8")
             st.download_button("📥 Download predictions (CSV)", data=csv_bytes,
-                               file_name=f"predictions_{model_name}.csv",
-                               mime="text/csv", key="dl_preds_main")
+                               file_name="predictions_calibrated_5k.csv", mime="text/csv")
 
-            if overlap/len(FEATS) < 0.6:
-                st.warning("⚠️ Feature overlap below 60 %. Predictions may be unreliable.")
+            # Low-overlap warning
+            if overlap/len(FEATS_5K) < 0.6:
+                st.warning("⚠️ Feature overlap below 60 %. Predictions may be unreliable. Consider updating models/id_map.csv with more aliases.")
+
+            # Low-confidence hint
+            low = (~conf_ok).sum()
+            if low > 0:
+                st.info(f"ℹ️ {low} sample(s) flagged as Indeterminate — low max-prob, small margin, or high entropy.")
         except Exception as e:
             st.exception(e)
 
 with tab2:
     st.subheader("Paste one sample (two lines)")
-    st.caption("Line 1: comma-separated gene names.  Line 2: comma-separated values.")
-    head_preview = ",".join(FEATS_SMALL[:25]) + ("..." if len(FEATS_SMALL) > 25 else "")
-    vals_preview = ",".join(["0"] * min(25, len(FEATS_SMALL))) + ("..." if len(FEATS_SMALL) > 25 else "")
-    txt = st.text_area("Paste here", value=head_preview + "\n" + vals_preview, height=140)
+    st.caption("Line 1: comma-separated gene symbols (HGNC).  Line 2: comma-separated values.")
+    preview_genes = ",".join(FEATS_5K[:25]) + ("..." if len(FEATS_5K) > 25 else "")
+    preview_vals = ",".join(["0"] * min(25, len(FEATS_5K))) + ("..." if len(FEATS_5K) > 25 else "")
+    txt = st.text_area("Paste here", value=preview_genes + "\n" + preview_vals, height=140)
 
     if st.button("Predict (pasted)"):
         try:
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
             if len(lines) < 2:
                 raise ValueError("Provide two lines: header then values.")
-            genes = [norm_gene(g) for g in lines[0].split(",")]
-            vals  = [float(x.strip()) for x in lines[1].split(",")]
-            df = pd.DataFrame([vals], columns=genes, index=["sample_1"])
+            genes = [g.strip() for g in lines[0].split(",")]
+            vals = [float(x.strip()) for x in lines[1].split(",")]
+            df_user = pd.DataFrame([vals], columns=genes, index=["sample_1"])
 
-            normed_cols = [norm_gene(c) for c in df.columns]
-            mapped_small = map_cols_to_bundle(normed_cols, FEATS_SMALL)
-            mapped_big   = map_cols_to_bundle(normed_cols, FEATS_BIG)
-            ov_small = len(set(mapped_small) & set(FEATS_SMALL))
-            ov_big   = len(set(mapped_big)   & set(FEATS_BIG))
+            X_ens = map_symbols_to_ensembl_df(df_user)
+            overlap = len(set(X_ens.columns) & set(FEATS_5K))
+            X = align_to_training_features(X_ens, FEATS_5K)
 
-            if ov_small >= ov_big:
-                model_name, mdl, FEATS, CLASSES, MU, SD = ("panel-5k", model_small, FEATS_SMALL, CLASSES_SMALL, MU_SMALL, SD_SMALL)
-                df.columns = mapped_small
-            else:
-                model_name, mdl, FEATS, CLASSES, MU, SD = ("full-60k",  model_big,   FEATS_BIG,   CLASSES_BIG,   MU_BIG,   SD_BIG)
-                df.columns = mapped_big
+            proba = model.predict_proba(X)
+            classes = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
 
-            overlap = len(set(df.columns) & set(FEATS))
-            X = align_to_features(df, FEATS)
+            maxp = float(proba.max(axis=1)[0])
+            margin = float(top2_margin(proba)[0])
+            ent = float(entropy_bits(proba)[0])
+            conf_ok = (maxp >= 0.70) and (margin >= 0.20) and (ent <= 1.2)
 
-            if MU is not None and SD is not None and len(MU) == X.shape[1]:
-                Xv = (X.values - MU) / SD
-            else:
-                mu_local = X.mean(axis=0).values
-                sd_local = X.std(axis=0).values
-                sd_local = np.where(sd_local < 1e-8, 1.0, sd_local)
-                Xv = (X.values - mu_local) / sd_local
-
-            # --- NEW: keep feature names when predicting ---
-            Xv_df = pd.DataFrame(Xv, columns=FEATS, index=X.index)
-            proba = mdl.predict_proba(Xv_df)
-
-            cols = CLASSES if CLASSES else [f"class_{i}" for i in range(proba.shape[1])]
-            preds = pd.DataFrame(proba, columns=cols, index=["sample_1"])
-            conf = preds.max(axis=1).iloc[0]
-            st.caption(f"Model: {model_name} • Overlap: {overlap}/{len(FEATS)} ({overlap/len(FEATS)*100:.1f}%) • Confidence: {conf:.2f}")
+            df_preds = pd.DataFrame(proba, columns=classes, index=["sample_1"])
+            st.caption(f"Overlap with 5k panel: {overlap}/{len(FEATS_5K)} ({overlap/len(FEATS_5K)*100:.1f}%) • Confidence: {maxp:.3f}")
             st.subheader("Predicted probabilities")
-            st.dataframe(preds.style.format({c:"{:.3f}" for c in cols}), use_container_width=True)
+            st.dataframe(df_preds.style.format({c: "{:.3f}" for c in classes}), use_container_width=True)
+
+            verdict = "✅ Confident call" if conf_ok else "🟡 Indeterminate — Needs Review"
+            st.info(f"{verdict} • max_prob={maxp:.3f} • margin={margin:.3f} • entropy={ent:.3f}")
         except Exception as e:
             st.exception(e)
 
 st.divider()
-st.caption("Model & app © BRCATranstypia • Educational research prototype")
+st.caption("Model & app © BRCATranstypia • Calibrated pipeline (TCGA-anchored) • Educational research prototype")
+
+
+
 
 
 
