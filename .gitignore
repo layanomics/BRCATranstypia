@@ -66,3 +66,4 @@ data/temp/
 # Notebooks outputs (optional—keep if outputs are huge)
 **/.ipynb_checkpoints/
 models/model_panel5k_quantile_svm_isotonic.joblib
+models/model_panel5k_quantile_svm_isotonic.joblib
