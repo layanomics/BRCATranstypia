@@ -265,48 +265,95 @@ with tab1:
                                file_name="predictions_calibrated_multi_panel.csv", mime="text/csv")
 
 with tab2:
-    st.subheader("Paste one sample (two lines)")
-    st.caption("Line 1: comma-separated gene symbols.  Line 2: comma-separated values.")
-    # preview based on the first panel (usually 5k)
-    example_feats = PANELS[0]["feats"][:25]
-    preview_genes = ",".join(example_feats) + "..."
-    preview_vals = ",".join(["0"] * len(example_feats)) + "..."
-    txt = st.text_area("Paste here", value=preview_genes + "\n" + preview_vals, height=140)
+    st.subheader("Paste from Excel (header + one or more rows)")
+    st.caption("You can paste directly from Excel. We accept tabs, commas, or spaces between values.")
 
-    if st.button("Predict (pasted)"):
+    example_feats = PANELS[0]["feats"][:12]
+    preview_genes = "\t".join(example_feats)
+    preview_vals1 = "\t".join(["0"] * len(example_feats))
+    preview_vals2 = "\t".join(["0.1"] * len(example_feats))
+    demo = preview_genes + "\n" + preview_vals1 + "\n" + preview_vals2
+
+    txt = st.text_area("Paste here", value=demo, height=180)
+
+    if st.button("Predict (from paste)"):
         try:
+            import re
+
+            # 1) split into non-empty lines
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
             if len(lines) < 2:
-                raise ValueError("Provide two lines: header then values.")
-            genes = [g.strip() for g in lines[0].split(",")]
-            vals = [float(x.strip()) for x in lines[1].split(",")]
-            df_user = pd.DataFrame([vals], columns=genes, index=["sample_1"])
+                raise ValueError("Provide a header line (genes) followed by one or more data lines.")
 
+            # 2) split header into genes (tabs/commas/spaces all OK)
+            header = re.split(r"[,\t ]+", lines[0].strip())
+            genes = [g for g in header if g]
+            if len(genes) == 0:
+                raise ValueError("No genes detected in the first line.")
+
+            # 3) parse each data row, ensuring the same number of columns
+            values = []
+            for i, row in enumerate(lines[1:], start=1):
+                toks = [t for t in re.split(r"[,\t ]+", row.strip()) if t]
+                if len(toks) != len(genes):
+                    raise ValueError(f"Row {i} has {len(toks)} values but header has {len(genes)} genes.")
+                try:
+                    values.append([float(t) for t in toks])
+                except ValueError:
+                    raise ValueError(f"Row {i} contains non-numeric values. Make sure numbers use a dot as decimal.")
+
+            # 4) build DataFrame: samples x genes
+            idx = [f"sample_{i}" for i in range(1, len(values) + 1)]
+            df_user = pd.DataFrame(values, columns=genes, index=idx)
+
+            # 5) map symbols -> Ensembl, pick panel, align, predict (same as upload flow)
             X_ens = map_symbols_to_ensembl_df(df_user)
-
             best = pick_best_panel(set(X_ens.columns))
             panel = best["panel"]
             X = align_for_panel(X_ens, panel)
 
             proba = panel["model"].predict_proba(X)
-            top1, top2, maxp_arr, margin_arr = top2_info(proba, panel["classes"])
-            maxp = float(maxp_arr[0]); margin = float(margin_arr[0])
-            ent = float(entropy_bits(proba)[0])
-            conf_ok = (maxp >= CONF_THRESH) and (margin >= MARGIN_THRESH) and (ent <= ENTROPY_THRESH)
+            top1, top2, maxp, margin = top2_info(proba, panel["classes"])
+            ent = entropy_bits(proba)
+            conf_ok = (maxp >= CONF_THRESH) & (margin >= MARGIN_THRESH) & (ent <= ENTROPY_THRESH)
 
-            df_preds = pd.DataFrame(proba, columns=panel["classes"], index=["sample_1"])
+            df_preds = pd.DataFrame(proba, columns=panel["classes"], index=X.index)
+            summary = pd.DataFrame({
+                "predicted_subtype": top1,
+                "second_best": top2,
+                "top2_margin": margin,
+                "max_prob": maxp,
+                "entropy_bits": ent,
+                "confident_call": conf_ok
+            }, index=X.index)
+
             st.caption(
                 f"Panel: **{panel['name']}** • overlap {best['overlap']}/{len(panel['feats'])} "
-                f"({best['ratio']*100:.1f}%) • Confidence: {maxp:.3f}  \n"
+                f"({best['ratio']*100:.1f}%) • Mean confidence: {float(np.mean(maxp)):.3f}  \n"
                 f"Thresholds → prob≥{CONF_THRESH}, margin≥{MARGIN_THRESH}, entropy≤{ENTROPY_THRESH}"
             )
+            if best["ratio"] < 0.6:
+                st.warning("⚠️ Feature overlap < 60%. Predictions may be less reliable.")
+            if (~conf_ok).sum() > 0:
+                st.info(f"ℹ️ {(~conf_ok).sum()} sample(s) flagged as Indeterminate.")
+
             st.subheader("Predicted probabilities")
             st.dataframe(df_preds.style.format("{:.3f}"), use_container_width=True)
 
-            verdict = "✅ Confident call" if conf_ok else "🟡 Indeterminate — Needs Review"
-            st.info(f"{verdict} • top1={top1[0]} • top2={top2[0]} • margin={margin:.3f} • entropy={ent:.3f}")
+            st.subheader("Summary (Top-2, margin, confidence gates)")
+            st.dataframe(
+                summary[["predicted_subtype","second_best","top2_margin","max_prob","entropy_bits","confident_call"]]
+                .style.format({"top2_margin":"{:.3f}","max_prob":"{:.3f}","entropy_bits":"{:.3f}"}),
+                use_container_width=True
+            )
+
+            csv_bytes = summary.join(df_preds).to_csv(index=True).encode("utf-8")
+            st.download_button("📥 Download predictions (CSV)", data=csv_bytes,
+                               file_name="predictions_from_paste.csv", mime="text/csv")
+
         except Exception as e:
             st.exception(e)
+
 
 st.divider()
 st.caption("Methods: Multi-panel auto-detect • symbol→Ensembl mapping (aliases via models/id_map.csv) • "
