@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (Jaccard panel selector, exact model features, 60k demo, inline PDF link)
+# app.py — BRCATranstypia 
 
 from pathlib import Path
 import io, re
@@ -6,16 +6,54 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
+from base64 import b64encode
 
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
 
-# 🔗 Use blob URL so most browsers render PDF inline (raw often downloads)
-GUIDE_URL = "https://github.com/layanomics/BRCATranstypia/blob/main/webapp/static/User_Guidelines.pdf"
-st.markdown(f"[📘 Open Full User Guidelines (PDF)]({GUIDE_URL})")
+# --- Inline PDF (no GitHub) ---
+def find_root(start: Path) -> Path:
+    p = start.resolve()
+    for _ in range(8):
+        if (p / "models").exists() and (p / "webapp").exists():
+            return p
+        p = p.parent
+    return start
 
+THIS = Path(__file__).resolve()
+ROOT = find_root(THIS.parent)
+GUIDE_PATH = ROOT / "webapp" / "static" / "User_Guidelines.pdf"
+
+def show_user_guide_inline():
+    if not GUIDE_PATH.exists():
+        st.warning("User guide PDF not found at `webapp/static/User_Guidelines.pdf`.")
+        return
+    pdf_bytes = GUIDE_PATH.read_bytes()
+    b64 = b64encode(pdf_bytes).decode("utf-8")
+    st.markdown(
+        f"""
+        <details>
+          <summary><b>📘 View User Guidelines (inline)</b></summary>
+          <div style="margin-top:10px;">
+            <iframe src="data:application/pdf;base64,{b64}"
+                    width="100%" height="700px"
+                    style="border:1px solid #ddd;border-radius:8px;"></iframe>
+          </div>
+        </details>
+        """,
+        unsafe_allow_html=True,
+    )
+    st.caption("Tip: right-click → “Open frame in new tab” for full screen.")
+show_user_guide_inline()
+st.markdown(
+    "[🌐 Open User Guidelines in new tab](/webapp/static/User_Guidelines.pdf)",
+    unsafe_allow_html=True
+)
+
+
+# ---- Confidence gate thresholds ----
 CONF_THRESH    = 0.85
 MARGIN_THRESH  = 0.15
 ENTROPY_THRESH = 1.40
@@ -31,17 +69,6 @@ with st.sidebar:
         "**Disclaimer**: Research/educational use only."
     )
 
-def find_root(start: Path) -> Path:
-    p = start.resolve()
-    for _ in range(8):
-        if (p / "models").exists() and (p / "webapp").exists():
-            return p
-        p = p.parent
-    return start
-
-THIS = Path(__file__).resolve()
-ROOT = find_root(THIS.parent)
-
 def strip_ver(s: str) -> str:
     return str(s).split(".")[0]
 
@@ -53,7 +80,7 @@ def read_feats_file(p: Path) -> list[str]:
             seen.add(x); out.append(x)
     return out
 
-# ---------- PANELS: load model, then take features from model.feature_names_in_ (exact match) ----------
+# ---------- PANELS: get exact features from model.feature_names_in_ ----------
 PANELS_RAW = [
     dict(
         name="5k_panel_svm",
@@ -79,11 +106,7 @@ for cfg in PANELS_RAW:
         if cfg["feats_file"].exists() and cfg["model_path"].exists():
             payload = joblib.load(cfg["model_path"])
             model = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-            # Prefer exact feature names from the trained model (prevents version mismatch)
-            if hasattr(model, "feature_names_in_"):
-                feats = list(model.feature_names_in_)
-            else:
-                feats = read_feats_file(cfg["feats_file"])
+            feats = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else read_feats_file(cfg["feats_file"])
             classes = np.array(getattr(model, "classes_", []))
             PANELS.append(dict(
                 name=cfg["name"], feats=feats, model=model, classes=classes,
@@ -115,7 +138,7 @@ def build_symbol_to_ensembl():
     return sym2ens
 
 SYM2ENS = build_symbol_to_ensembl()
-ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
+ENSEMBL_PAT = re.compile(r"ENSG\\d{9,}")
 
 def parse_any_table(upload) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(upload.getvalue()))
@@ -154,20 +177,18 @@ def top2_info(P: np.ndarray, classes: np.ndarray):
             P[np.arange(P.shape[0]), top1_pos],
             P[np.arange(P.shape[0]), top1_pos] - P[np.arange(P.shape[0]), top2_pos])
 
-# 🔧 NEW: upgrade versionless Ensembl to the model’s exact feature names (adds versions if needed)
+# Upgrade versionless Ensembl to the model’s exact feature names (adds versions if needed)
 def conform_to_model_feature_names(X: pd.DataFrame, model) -> pd.DataFrame:
     feats = getattr(model, "feature_names_in_", None)
     if feats is None:
         return X
     feats = list(feats)
-    # Map base ENSG -> exact model feature (first occurrence)
     def base(s): return str(s).split(".")[0]
     model_map = {}
     for f in feats:
         fb = base(f)
         if fb not in model_map:
             model_map[fb] = f
-    # Rename columns where possible
     ren = {}
     for c in X.columns:
         cb = base(c)
@@ -177,16 +198,19 @@ def conform_to_model_feature_names(X: pd.DataFrame, model) -> pd.DataFrame:
         X = X.rename(columns=ren)
     return X
 
-# 🧮 Jaccard-based panel selection (prefers 60k for 50k+ inputs)
-def pick_best_panel(X_cols: set[str]) -> dict:
+# ---- Panel selection on base Ensembl IDs; prefer 60k if user supplies ≥50k genes ----
+def _base_set(names):
+    return {str(n).split(".")[0] for n in names}
+
+def pick_best_panel(base_cols: set[str]) -> dict:
     best = None
     for p in PANELS:
-        fset = set(p["feats"])
-        inter = len(X_cols & fset)
-        union = len(X_cols | fset)
-        jacc = inter / max(1, union)
-        cover = inter / max(1, len(fset))
-        cand = dict(panel=p, inter=inter, union=union, jacc=jacc, cover=cover, panel_size=len(fset))
+        fset_base = _base_set(p["feats"])
+        inter = len(base_cols & fset_base)
+        union = len(base_cols | fset_base)
+        jacc  = inter / max(1, union)
+        cover = inter / max(1, len(fset_base))
+        cand  = dict(panel=p, inter=inter, union=union, jacc=jacc, cover=cover, panel_size=len(fset_base))
         if (
             best is None
             or cand["jacc"] > best["jacc"] + 1e-6
@@ -194,11 +218,16 @@ def pick_best_panel(X_cols: set[str]) -> dict:
             or (abs(cand["jacc"] - best["jacc"]) <= 1e-6 and cand["panel_size"] == best["panel_size"] and p.get("preferred", False))
         ):
             best = cand
+    # If user provided ≥50k base Ensembl IDs and we have 60k panel, force 60k
+    have_60k = next((pp for pp in PANELS if "60k" in pp["name"]), None)
+    if have_60k and len(base_cols) >= 50000:
+        best = dict(best, panel=have_60k)
     return best
 
 def align_for_panel(X, panel):
     return X.reindex(columns=panel["feats"]).fillna(0.0)
 
+# ---- Demo (cached & tiny preview) ----
 DEMO_PATH = ROOT / "data" / "processed" / "demo_60k_ensembl.csv"
 
 @st.cache_data(show_spinner=False)
@@ -206,11 +235,6 @@ def load_demo_df():
     if DEMO_PATH.exists():
         return pd.read_csv(DEMO_PATH, index_col=0)
     return None
-
-def show_wide_preview(df, n_genes=25):
-    small = df.iloc[:, :n_genes].copy()
-    st.dataframe(small, use_container_width=True, height=260)
-    st.caption(f"Preview shows first **{n_genes}** genes out of **{df.shape[1]}** total.")
 
 def compute_overlap_stats(mapped_cols: set[str], panel_feats: list[str]):
     fset = set(panel_feats)
@@ -222,14 +246,14 @@ def compute_overlap_stats(mapped_cols: set[str], panel_feats: list[str]):
     return inter, len(fset), cover, jacc, missing
 
 def run_predict(Xsym: pd.DataFrame):
-    # 1) Map symbols→Ensembl (versionless)
+    # 1) Symbols→Ensembl (versionless) or strip version if Ensembl provided
     X_ens = map_to_ensembl_df(Xsym)
-    # 2) Pick panel on versionless names using Jaccard
-    best = pick_best_panel(set([strip_ver(c) for c in X_ens.columns]))
+    # 2) Pick panel on base Ensembl names
+    best = pick_best_panel({strip_ver(c) for c in X_ens.columns})
     panel = best["panel"]
-    # 3) Upgrade to model’s exact feature names (adds versions for 60k)
+    # 3) Conform column names to model exact features (adds versions for 60k)
     X_conf = conform_to_model_feature_names(X_ens, panel["model"])
-    # 4) Overlap report *after* name conformance
+    # 4) Overlap after conformance
     n_overlap, n_total, cover, jacc, missing = compute_overlap_stats(set(X_conf.columns), panel["feats"])
     # 5) Align & predict
     X = align_for_panel(X_conf, panel)
@@ -250,7 +274,7 @@ def run_predict(Xsym: pd.DataFrame):
     return summary, pd.DataFrame(proba, columns=panel["classes"], index=X.index), panel["name"], overlap
 
 demo_df = load_demo_df()
-tab1, tab2, tab3 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel", "🧪 Try demo dataset (60k)"])
+tab1, tab2, tab3 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel", "🧪 Try demo dataset"])
 
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
@@ -274,7 +298,7 @@ with tab1:
         except Exception as e:
             st.exception(e)
     if demo_df is not None:
-        st.download_button("⬇️ Download demo (legacy 60k subset)", data=demo_df.to_csv().encode(),
+        st.download_button("⬇️ Download demo (legacy 60k dataset)", data=demo_df.to_csv().encode(),
                            file_name="demo_60k_ensembl.csv", mime="text/csv")
 
 with tab2:
@@ -319,18 +343,17 @@ with tab2:
             st.exception(e)
 
 with tab3:
-    st.subheader("Use a built-in demo dataset (Legacy 60k)")
+    st.subheader("Use a built-in demo dataset (Legacy dataset)")
     if demo_df is None:
         st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
     else:
         st.caption("Small TCGA-BRCA subset (Ensembl IDs; aligned to legacy 60k panel).")
-        # Tiny preview to keep UI fast
-        small = demo_df.iloc[:, :25]
+        small = demo_df.iloc[:, :25]  # tiny preview for snappy UI
         st.dataframe(small, use_container_width=True, height=260)
         st.caption(f"Preview shows first **25** genes out of **{demo_df.shape[1]}** total.")
         colA, colB = st.columns([1,1])
         with colA:
-            if st.button("🔮 Predict on demo (60k)"):
+            if st.button("🔮 Predict on demo"):
                 try:
                     summary, proba_df, used_panel, overlap = run_predict(demo_df)
                     st.success(f"Used panel: **{used_panel}**")
@@ -342,7 +365,7 @@ with tab3:
                 except Exception as e:
                     st.exception(e)
         with colB:
-            st.download_button("⬇️ Download demo CSV (60k)", data=demo_df.to_csv().encode(),
+            st.download_button("⬇️ Download demo CSV ", data=demo_df.to_csv().encode(),
                                file_name="demo_60k_ensembl.csv", mime="text/csv")
 
-st.caption("© 2025 BRCATranstypia | Jaccard auto-detect • Exact model features • Legacy 60k support • Ensembl mapping • Clinical gating")
+st.caption("© 2025 BRCATranstypia | Inline user guide • Jaccard auto-detect (base Ensembl) • legacy Dataset support • Ensembl mapping • Clinical gating")
