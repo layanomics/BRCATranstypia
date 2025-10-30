@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (Multi-panel, Jaccard selector, 60k demo, inline PDF link)
+# app.py — BRCATranstypia (Jaccard panel selector, exact model features, 60k demo, inline PDF link)
 
 from pathlib import Path
 import io, re
@@ -7,23 +7,19 @@ import pandas as pd
 import streamlit as st
 import joblib
 
-# ------------------------- PAGE CONFIG -------------------------
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 
-# ------------------------- TITLE + HERO -------------------------
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
 
-# Simple inline hyperlink to the guidelines PDF (edit URL or ship a local file if you prefer)
-GUIDE_URL = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
+# 🔗 Use blob URL so most browsers render PDF inline (raw often downloads)
+GUIDE_URL = "https://github.com/layanomics/BRCATranstypia/blob/main/webapp/static/User_Guidelines.pdf"
 st.markdown(f"[📘 Open Full User Guidelines (PDF)]({GUIDE_URL})")
 
-# ====== Clinical-style reporting thresholds ======
 CONF_THRESH    = 0.85
 MARGIN_THRESH  = 0.15
 ENTROPY_THRESH = 1.40
 
-# ------------------------- SIDEBAR QUICK HELP -------------------------
 with st.sidebar:
     st.markdown("### 🧭 User Guidelines (Quick)")
     st.info(
@@ -35,7 +31,6 @@ with st.sidebar:
         "**Disclaimer**: Research/educational use only."
     )
 
-# ------------------------- LOCATE PROJECT ROOT -------------------------
 def find_root(start: Path) -> Path:
     p = start.resolve()
     for _ in range(8):
@@ -47,31 +42,31 @@ def find_root(start: Path) -> Path:
 THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 
-# ------------------------- PANEL REGISTRY -------------------------
 def strip_ver(s: str) -> str:
     return str(s).split(".")[0]
 
-def read_feats(p: Path) -> list[str]:
+def read_feats_file(p: Path) -> list[str]:
     seen, out = set(), []
     for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-        x = strip_ver(ln.strip())
+        x = ln.strip()
         if x and x not in seen:
             seen.add(x); out.append(x)
     return out
 
+# ---------- PANELS: load model, then take features from model.feature_names_in_ (exact match) ----------
 PANELS_RAW = [
     dict(
         name="5k_panel_svm",
-        feats=ROOT / "models" / "features_panel5k.txt",
-        model=ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
+        feats_file=ROOT / "models" / "features_panel5k.txt",
+        model_path=ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
         note="Quantile + Linear SVM (C=3) + Isotonic (calibrated)",
         expects="TPM-like scale; normalization handled internally",
         preferred=True,
     ),
     dict(
         name="60k_panel_legacy",
-        feats=ROOT / "models" / "features.txt",
-        model=ROOT / "models" / "model.joblib",
+        feats_file=ROOT / "models" / "features.txt",
+        model_path=ROOT / "models" / "model.joblib",
         note="Legacy 60k model (GDC baseline)",
         expects="Training-like scale (no quantile step)",
         preferred=False,
@@ -81,10 +76,14 @@ PANELS_RAW = [
 PANELS = []
 for cfg in PANELS_RAW:
     try:
-        if cfg["feats"].exists() and cfg["model"].exists():
-            feats = read_feats(cfg["feats"])
-            payload = joblib.load(cfg["model"])
+        if cfg["feats_file"].exists() and cfg["model_path"].exists():
+            payload = joblib.load(cfg["model_path"])
             model = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
+            # Prefer exact feature names from the trained model (prevents version mismatch)
+            if hasattr(model, "feature_names_in_"):
+                feats = list(model.feature_names_in_)
+            else:
+                feats = read_feats_file(cfg["feats_file"])
             classes = np.array(getattr(model, "classes_", []))
             PANELS.append(dict(
                 name=cfg["name"], feats=feats, model=model, classes=classes,
@@ -97,7 +96,6 @@ if not PANELS:
     st.error("❌ No panels found in ./models/. Please upload trained models first.")
     st.stop()
 
-# ------------------------- SYMBOL/ENSEMBL MAP -------------------------
 @st.cache_resource
 def build_symbol_to_ensembl():
     id_map = ROOT / "models" / "id_map.csv"
@@ -119,10 +117,8 @@ def build_symbol_to_ensembl():
 SYM2ENS = build_symbol_to_ensembl()
 ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
 
-# ------------------------- PARSING & ALIGNMENT -------------------------
 def parse_any_table(upload) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(upload.getvalue()))
-    # If first column is gene header, pivot to samples×genes
     if df.columns[0].strip().lower() in {"gene", "genes", "symbol", "gene_symbol", "ensembl", "ensembl_id"}:
         df = df.set_index(df.columns[0]).T
     if df.index.name is None:
@@ -130,21 +126,17 @@ def parse_any_table(upload) -> pd.DataFrame:
     return df
 
 def map_to_ensembl_df(Xin: pd.DataFrame) -> pd.DataFrame:
-    """Accept columns as symbols OR Ensembl; return Ensembl IDs (version-stripped), de-duplicated."""
     cols = list(Xin.columns)
-    # Case 1: looks like Ensembl → strip version and collapse dups
+    # If looks like Ensembl → strip version to base, then collapse duplicates
     if sum(1 for c in cols if ENSEMBL_PAT.match(str(c))) / max(1, len(cols)) > 0.6:
         ensg = [strip_ver(c) for c in cols]
         sub = Xin.copy(); sub.columns = ensg
         return sub.T.groupby(level=0).mean().T
-    # Case 2: symbols → map via SYM2ENS
-    mapped = []
-    for c in cols:
-        m = SYM2ENS.get(str(c).upper())
-        if m:
-            mapped.append((c, m))
+    # Else symbols → map via SYM2ENS
+    mapped = [(c, SYM2ENS.get(str(c).upper())) for c in cols]
+    mapped = [(c, e) for (c, e) in mapped if e]
     if not mapped:
-        return Xin.iloc[:, :0]  # empty
+        return Xin.iloc[:, :0]
     sub = Xin[[c for c, _ in mapped]].copy()
     sub.columns = [e for _, e in mapped]
     return sub.T.groupby(level=0).mean().T
@@ -162,20 +154,38 @@ def top2_info(P: np.ndarray, classes: np.ndarray):
             P[np.arange(P.shape[0]), top1_pos],
             P[np.arange(P.shape[0]), top1_pos] - P[np.arange(P.shape[0]), top2_pos])
 
-# ---------- NEW: Jaccard-based panel selection (fixes 50k→60k vs 5k issue) ----------
+# 🔧 NEW: upgrade versionless Ensembl to the model’s exact feature names (adds versions if needed)
+def conform_to_model_feature_names(X: pd.DataFrame, model) -> pd.DataFrame:
+    feats = getattr(model, "feature_names_in_", None)
+    if feats is None:
+        return X
+    feats = list(feats)
+    # Map base ENSG -> exact model feature (first occurrence)
+    def base(s): return str(s).split(".")[0]
+    model_map = {}
+    for f in feats:
+        fb = base(f)
+        if fb not in model_map:
+            model_map[fb] = f
+    # Rename columns where possible
+    ren = {}
+    for c in X.columns:
+        cb = base(c)
+        if cb in model_map:
+            ren[c] = model_map[cb]
+    if ren:
+        X = X.rename(columns=ren)
+    return X
+
+# 🧮 Jaccard-based panel selection (prefers 60k for 50k+ inputs)
 def pick_best_panel(X_cols: set[str]) -> dict:
-    """
-    Choose panel using Jaccard similarity:
-      jacc = |X ∩ panel| / |X ∪ panel|
-    Tie-breakers: larger panel wins; then 'preferred=True'.
-    """
     best = None
     for p in PANELS:
         fset = set(p["feats"])
         inter = len(X_cols & fset)
         union = len(X_cols | fset)
         jacc = inter / max(1, union)
-        cover = inter / max(1, len(fset))  # for reporting
+        cover = inter / max(1, len(fset))
         cand = dict(panel=p, inter=inter, union=union, jacc=jacc, cover=cover, panel_size=len(fset))
         if (
             best is None
@@ -189,7 +199,6 @@ def pick_best_panel(X_cols: set[str]) -> dict:
 def align_for_panel(X, panel):
     return X.reindex(columns=panel["feats"]).fillna(0.0)
 
-# ------------------------- DEMO DATASET (LEGACY 60k) -------------------------
 DEMO_PATH = ROOT / "data" / "processed" / "demo_60k_ensembl.csv"
 
 @st.cache_data(show_spinner=False)
@@ -207,33 +216,32 @@ def compute_overlap_stats(mapped_cols: set[str], panel_feats: list[str]):
     fset = set(panel_feats)
     inter = len(mapped_cols & fset)
     union = len(mapped_cols | fset)
-    cover = inter / max(1, len(fset))   # % of panel covered
-    jacc  = inter / max(1, union)       # Jaccard similarity
+    cover = inter / max(1, len(fset))
+    jacc  = inter / max(1, union)
     missing = sorted(list(fset - mapped_cols))
     return inter, len(fset), cover, jacc, missing
 
 def run_predict(Xsym: pd.DataFrame):
-    # Map to Ensembl & pick best panel by Jaccard
+    # 1) Map symbols→Ensembl (versionless)
     X_ens = map_to_ensembl_df(Xsym)
-    best = pick_best_panel(set(X_ens.columns))
+    # 2) Pick panel on versionless names using Jaccard
+    best = pick_best_panel(set([strip_ver(c) for c in X_ens.columns]))
     panel = best["panel"]
-
-    # Overlap report (before alignment)
-    n_overlap, n_total, cover, jacc, missing = compute_overlap_stats(set(X_ens.columns), panel["feats"])
-
-    # Align, predict, compute confidence
-    X = align_for_panel(X_ens, panel)
+    # 3) Upgrade to model’s exact feature names (adds versions for 60k)
+    X_conf = conform_to_model_feature_names(X_ens, panel["model"])
+    # 4) Overlap report *after* name conformance
+    n_overlap, n_total, cover, jacc, missing = compute_overlap_stats(set(X_conf.columns), panel["feats"])
+    # 5) Align & predict
+    X = align_for_panel(X_conf, panel)
     proba = panel["model"].predict_proba(X)
     top1, top2, maxp, margin = top2_info(proba, panel["classes"])
     ent = entropy_bits(proba)
     conf_ok = (maxp >= CONF_THRESH) & (margin >= MARGIN_THRESH) & (ent <= ENTROPY_THRESH)
-
     summary = pd.DataFrame({
         "predicted_subtype": top1, "second_best": top2,
         "top2_margin": margin, "max_prob": maxp,
         "entropy_bits": ent, "confident_call": conf_ok
     }, index=X.index)
-
     overlap = dict(
         n_overlap=n_overlap, n_total=n_total,
         coverage=cover, jaccard=jacc,
@@ -241,11 +249,9 @@ def run_predict(Xsym: pd.DataFrame):
     )
     return summary, pd.DataFrame(proba, columns=panel["classes"], index=X.index), panel["name"], overlap
 
-# ------------------------- MAIN UI -------------------------
 demo_df = load_demo_df()
 tab1, tab2, tab3 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel", "🧪 Try demo dataset (60k)"])
 
-# ===== Tab 1 — Upload =====
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
     st.caption("Columns = gene symbols (HGNC) **or** Ensembl IDs. Rows = samples.")
@@ -271,7 +277,6 @@ with tab1:
         st.download_button("⬇️ Download demo (legacy 60k subset)", data=demo_df.to_csv().encode(),
                            file_name="demo_60k_ensembl.csv", mime="text/csv")
 
-# ===== Tab 2 — Paste =====
 with tab2:
     st.subheader("Paste from Excel (header optional)")
     st.caption("We accept tabs, commas, or spaces. First line may be **gene symbols**/**Ensembl IDs** or values.")
@@ -280,7 +285,6 @@ with tab2:
         try:
             lines = [l.strip() for l in txt.splitlines() if l.strip()]
             if not lines: raise ValueError("Please paste at least one line of values.")
-
             def is_numeric_line(line):
                 toks = re.split(r"[,\t ]+", line.strip())
                 nums = 0
@@ -288,20 +292,16 @@ with tab2:
                     try: float(t); nums += 1
                     except ValueError: pass
                 return nums > 0 and nums / len(toks) > 0.7
-
             header = re.split(r"[,\t ]+", lines[0].strip())
             has_header = not is_numeric_line(lines[0])
-
             if has_header:
                 genes = [g for g in header if g]; value_lines = lines[1:]
             else:
                 genes = PANELS[0]["feats"][: len(header)]; value_lines = lines
-
             values = []
             for row in value_lines:
                 toks = [t for t in re.split(r"[,\t ]+", row.strip()) if t]
                 values.append([float(t) for t in toks])
-
             df_user = pd.DataFrame(values, columns=genes, index=[f"sample_{i+1}" for i in range(len(values))])
             summary, proba_df, used_panel, overlap = run_predict(df_user)
             st.success(f"Used panel: **{used_panel}**")
@@ -318,15 +318,16 @@ with tab2:
         except Exception as e:
             st.exception(e)
 
-# ===== Tab 3 — Demo (Legacy 60k) =====
 with tab3:
     st.subheader("Use a built-in demo dataset (Legacy 60k)")
     if demo_df is None:
         st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
     else:
         st.caption("Small TCGA-BRCA subset (Ensembl IDs; aligned to legacy 60k panel).")
-        # Tiny, fast preview (avoid rendering 60k columns)
-        show_wide_preview(demo_df, n_genes=25)
+        # Tiny preview to keep UI fast
+        small = demo_df.iloc[:, :25]
+        st.dataframe(small, use_container_width=True, height=260)
+        st.caption(f"Preview shows first **25** genes out of **{demo_df.shape[1]}** total.")
         colA, colB = st.columns([1,1])
         with colA:
             if st.button("🔮 Predict on demo (60k)"):
@@ -344,4 +345,4 @@ with tab3:
             st.download_button("⬇️ Download demo CSV (60k)", data=demo_df.to_csv().encode(),
                                file_name="demo_60k_ensembl.csv", mime="text/csv")
 
-st.caption("© 2025 BRCATranstypia | Jaccard auto-detect • Quantile-calibrated SVM • Legacy 60k support • Ensembl mapping • Clinical gating")
+st.caption("© 2025 BRCATranstypia | Jaccard auto-detect • Exact model features • Legacy 60k support • Ensembl mapping • Clinical gating")
