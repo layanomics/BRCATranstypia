@@ -1,257 +1,415 @@
-# app.py — BRCATranstypia (5k/60k auto-detect, robust paste, 60k demo forced, z-score fix, web PDF link + inline)
+# webapp/app.py
+import io
+import re
+import json
 from pathlib import Path
-import io, re, requests
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import joblib
-from base64 import b64encode
 
+# ============== Config ==============
+TITLE = "BRCATranstypia — BRCA Subtype Predictor (Multi-panel)"
+GUIDE_URL = "https://layanomics.github.io/BRCATranstypia/User_Guidelines.pdf"  # Opens in new tab
+# If you prefer the raw GitHub link use the “?raw=1” trick:
+# GUIDE_URL = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
+
+ROOT = Path(__file__).resolve().parents[1] if (Path(__file__).name == "app.py") else Path(".")
+MODELS = {
+    "5k": ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
+    "60k": ROOT / "models" / "model.joblib",
+}
+FEAT_FILES = {
+    "5k": ROOT / "models" / "features_panel5k.txt",
+    "60k": ROOT / "models" / "features.txt",
+}
+IDMAP_FILE = ROOT / "models" / "id_map.csv"
+
+DEMO = {
+    "5k": ROOT / "data" / "processed" / "demo_panel5k_symbols.csv",
+    "60k": ROOT / "data" / "processed" / "demo_60k_ensembl.csv",
+}
+
+# ============== Page ==============
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
-st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
-st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
+st.title(TITLE)
 
-# --- User Guidelines ---
-GUIDE_URL_RAW = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/webapp/static/User_Guidelines.pdf"
-def show_user_guide_inline_and_link():
-    st.markdown(f'<a href="{GUIDE_URL_RAW}" target="_blank" rel="noopener">📘 Open User Guidelines in a new tab</a>', unsafe_allow_html=True)
+st.info(
+    "💡 Upload or paste normalized gene expression data. "
+    "The app **auto-detects the panel** (5k / 60k) and predicts the molecular subtype."
+)
+st.markdown(
+    f'<div style="margin-top:-0.5rem;margin-bottom:0.8rem;">'
+    f'📘 <a href="{GUIDE_URL}" target="_blank">Open Full User Guidelines</a>'
+    f"</div>",
+    unsafe_allow_html=True,
+)
+
+# ============== Cached resources ==============
+@st.cache_resource(show_spinner=False)
+def load_features(panel: str):
+    lst = [l.strip() for l in FEAT_FILES[panel].read_text().splitlines() if l.strip()]
+    return lst
+
+@st.cache_resource(show_spinner=False)
+def load_id_map():
+    if not IDMAP_FILE.exists():
+        return None
+    idm = pd.read_csv(IDMAP_FILE)
+    cols = {c.lower(): c for c in idm.columns}
+    need = {"symbol", "ensembl_id"}
+    if not need.issubset({c.lower() for c in idm.columns}):
+        return None
+    idm = idm.rename(columns={cols["symbol"]: "symbol", cols["ensembl_id"]: "ensembl_id"})
+    idm["ensg_stripped"] = idm["ensembl_id"].astype(str).str.split(".").str[0]
+    idm["symbol_up"] = idm["symbol"].astype(str).str.upper()
+    # prefer unique mapping by Ensembl stripped, then symbol uppercase
+    ensg_to_symbol = idm.drop_duplicates("ensg_stripped").set_index("ensg_stripped")["symbol"]
+    symbol_to_ensg = idm.drop_duplicates("symbol_up").set_index("symbol_up")["ensg_stripped"]
+    return {"ensg_to_symbol": ensg_to_symbol, "symbol_to_ensg": symbol_to_ensg}
+
+@st.cache_resource(show_spinner=False)
+def load_model(panel: str):
+    return joblib.load(MODELS[panel])
+
+@st.cache_data(show_spinner=False)
+def load_demo(panel: str):
+    if DEMO[panel].exists():
+        df = pd.read_csv(DEMO[panel])
+        # heuristics: assume first col is index if unnamed
+        if df.columns[0].lower() in {"", "index", "sample", "samples"}:
+            df = df.set_index(df.columns[0])
+        return df
+    return None
+
+# ============== Helpers ==============
+SPLIT = re.compile(r"[\t, ]+")
+
+def split_line(line: str):
+    return [t for t in SPLIT.split(line.strip()) if t]
+
+def looks_numeric_list(tokens):
     try:
-        r = requests.get(GUIDE_URL_RAW, timeout=10)
-        r.raise_for_status()
-        b64 = b64encode(r.content).decode("utf-8")
-        st.markdown(f"""
-        <details style="margin-top:.5rem;">
-          <summary><b>…or view it inline</b></summary>
-          <div style="margin-top:10px;">
-            <iframe src="data:application/pdf;base64,{b64}" width="100%" height="700px"
-                    style="border:1px solid #ddd;border-radius:8px;"></iframe>
-          </div>
-        </details>""", unsafe_allow_html=True)
+        _ = [float(x) for x in tokens]
+        return True
     except Exception:
-        st.warning("Couldn’t embed the PDF inline. Use the link above.")
-show_user_guide_inline_and_link()
+        return False
 
-CONF_THRESH, MARGIN_THRESH, ENTROPY_THRESH = 0.85, 0.15, 1.40
-with st.sidebar:
-    st.markdown("### 🧭 Quick Guidelines")
-    st.info(
-        "**Input**: rows = samples, cols = genes (symbols or Ensembl).\n\n"
-        "**Normalization**: TPM/log-like; internal quantile/z where needed.\n\n"
-        "**Panels**: Auto-detects 5k or 60k.\n\n"
-        "**Outputs**: LumA, LumB, Basal, Her2, Normal + confidence.\n\n"
-        f"**Clinical gate**: prob ≥ {CONF_THRESH}, margin ≥ {MARGIN_THRESH}, entropy ≤ {ENTROPY_THRESH}."
-    )
+def strip_ver(x: str) -> str:
+    return str(x).split(".")[0]
 
-# ---------- Helpers ----------
-def strip_ver(s): return str(s).split(".")[0]
-def read_feats_file(p: Path) -> list[str]:
-    seen, out = set(), []
-    for ln in p.read_text(encoding="utf-8", errors="ignore").splitlines():
-        x = ln.strip()
-        if x and x not in seen:
-            seen.add(x); out.append(x)
-    return out
+def _to_upper(seq):  # safe uppercase list
+    return [str(x).upper() for x in seq]
 
-ROOT = Path(__file__).resolve().parents[1]
-
-# ---------- PANELS ----------
-PANELS_RAW = [
-    dict(
-        name="5k_panel_svm",
-        feats_file=ROOT / "models" / "features_panel5k.txt",
-        model_path=ROOT / "models" / "model_panel5k_quantile_svm_best.joblib",
-        note="Quantile + Linear SVM (C=3) + Isotonic calibrated",
-        preferred=True,
-    ),
-    dict(
-        name="60k_panel_legacy",
-        feats_file=ROOT / "models" / "features.txt",
-        model_path=ROOT / "models" / "model.joblib",
-        note="Legacy 60k model (GDC baseline)",
-        preferred=False,
-    ),
-]
-PANELS = []
-for cfg in PANELS_RAW:
-    if cfg["feats_file"].exists() and cfg["model_path"].exists():
-        payload = joblib.load(cfg["model_path"])
-        model = payload["model"] if isinstance(payload, dict) and "model" in payload else payload
-        feats = list(model.feature_names_in_) if hasattr(model, "feature_names_in_") else read_feats_file(cfg["feats_file"])
-        classes = np.array(getattr(model, "classes_", []))
-        PANELS.append(dict(name=cfg["name"], feats=feats, model=model, classes=classes,
-                           note=cfg["note"], preferred=cfg["preferred"]))
-if not PANELS:
-    st.error("❌ No panels found in ./models/.")
-    st.stop()
-
-# ---------- Symbol→Ensembl ----------
-@st.cache_resource
-def build_symbol_to_ensembl():
-    id_map = ROOT / "models" / "id_map.csv"
-    df = pd.read_csv(id_map)
-    df.columns = [c.lower() for c in df.columns]
-    df["ensg"] = df["ensembl_id"].astype(str).str.split(".").str[0]
-    rows = [(str(r["symbol"]).upper(), r["ensg"]) for _, r in df.iterrows()]
-    if "aliases" in df.columns:
-        for _, r in df.iterrows():
-            for a in re.split(r"[|,;]", str(r.get("aliases", "") or "")):
-                a = a.strip().upper()
-                if a:
-                    rows.append((a, r["ensg"]))
-    sym2ens = {}
-    for k, v in rows:
-        sym2ens.setdefault(k, v)
-    return sym2ens
-SYM2ENS = build_symbol_to_ensembl()
-ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
-
-def map_to_ensembl_df(Xin: pd.DataFrame) -> pd.DataFrame:
-    cols = list(Xin.columns)
-    if sum(1 for c in cols if ENSEMBL_PAT.match(str(c))) / max(1, len(cols)) > 0.6:
-        ensg = [strip_ver(c) for c in cols]
-        sub = Xin.copy(); sub.columns = ensg
-        return sub.T.groupby(level=0).mean().T
-    mapped = [(c, SYM2ENS.get(str(c).upper())) for c in cols]
-    mapped = [(c, e) for (c, e) in mapped if e]
-    if not mapped:
-        return Xin.iloc[:, :0]
-    sub = Xin[[c for c, _ in mapped]].copy()
-    sub.columns = [e for _, e in mapped]
-    return sub.T.groupby(level=0).mean().T
-
-# ---------- z-score for 60k ----------
-STATS_60K_PATH = ROOT / "models" / "feature_stats_60k.npz"
-STATS_60K = None
-if STATS_60K_PATH.exists():
-    z = np.load(STATS_60K_PATH, allow_pickle=True)
-    STATS_60K = {"features": list(z["features"]),
-                 "mu": z["mean"].astype(float),
-                 "sd": np.where(z["std"].astype(float) == 0, 1.0, z["std"].astype(float))}
-def zscore_60k_if_available(X_aligned: pd.DataFrame, panel_name: str) -> pd.DataFrame:
-    if "60k" not in panel_name.lower() or STATS_60K is None:
-        return X_aligned
-    feats_app = list(X_aligned.columns)
-    feats_stat = STATS_60K["features"]
-    if len(feats_app) == len(feats_stat) and all(a == b for a, b in zip(feats_app, feats_stat)):
-        vals = (X_aligned.values - STATS_60K["mu"]) / STATS_60K["sd"]
-        return pd.DataFrame(vals, index=X_aligned.index, columns=X_aligned.columns)
-    return X_aligned
-
-# ---------- Prediction helpers ----------
-def entropy_bits(P): P = np.clip(P, 1e-12, 1.0); return (-(P * np.log2(P))).sum(axis=1)
-def top2_info(P, classes):
-    top2_idx = np.argpartition(P, -2, axis=1)[:, -2:]
-    row_max_is_second = P[np.arange(P.shape[0])[:, None], top2_idx].argmax(axis=1)
-    top1_pos = top2_idx[np.arange(P.shape[0]), row_max_is_second]
-    top2_pos = top2_idx[np.arange(P.shape[0]), 1 - row_max_is_second]
-    return (classes[top1_pos], classes[top2_pos],
-            P[np.arange(P.shape[0]), top1_pos],
-            P[np.arange(P.shape[0]), top1_pos] - P[np.arange(P.shape[0]), top2_pos])
-
-def _base_set(names): return {str(n).split(".")[0] for n in names}
-def pick_best_panel(base_cols:set[str]) -> dict:
-    best=None
-    for p in PANELS:
-        fset=_base_set(p["feats"]); inter=len(base_cols&fset); union=len(base_cols|fset)
-        jacc=inter/max(1,union)
-        cand=dict(panel=p,inter=inter,jacc=jacc,panel_size=len(fset))
-        if best is None or cand["jacc"]>best["jacc"] or (abs(cand["jacc"]-best["jacc"])<1e-6 and cand["panel_size"]>best["panel_size"]):
-            best=cand
-    if next((pp for pp in PANELS if "60k" in pp["name"]),None) and len(base_cols)>=50000:
-        best["panel"]=next(pp for pp in PANELS if "60k" in pp["name"])
-    return best
-def align_for_panel(X, panel): return X.reindex(columns=panel["feats"]).fillna(0.0)
-
-def run_predict(Xsym:pd.DataFrame,force_panel_name:str|None=None):
-    X_ens = map_to_ensembl_df(Xsym)
-    base_cols = {strip_ver(c) for c in X_ens.columns}
-    if force_panel_name:
-        panel = next((p for p in PANELS if p["name"]==force_panel_name),None)
-        if panel is None: raise ValueError(f"Panel {force_panel_name} not found.")
+def detect_panel_from_header(cols, feat5, feat6):
+    cols_up = _to_upper(cols)
+    ens_like = sum(1 for c in cols_up if c.startswith("ENSG"))
+    if ens_like > 0:
+        s5 = {strip_ver(c).upper() for c in feat5}
+        s6 = {strip_ver(c).upper() for c in feat6}
+        cset = {strip_ver(c) for c in cols_up}
     else:
-        panel = pick_best_panel(base_cols)["panel"]
-    X = align_for_panel(X_ens, panel)
-    X = zscore_60k_if_available(X, panel["name"])  # <-- apply z-normalization if 60k
-    proba = panel["model"].predict_proba(X)
-    top1, top2, maxp, margin = top2_info(proba, panel["classes"])
-    ent = entropy_bits(proba)
-    conf_ok = (maxp>=CONF_THRESH)&(margin>=MARGIN_THRESH)&(ent<=ENTROPY_THRESH)
-    summary = pd.DataFrame({"predicted_subtype":top1,"second_best":top2,"top2_margin":margin,
-                            "max_prob":maxp,"entropy_bits":ent,"confident_call":conf_ok}, index=X.index)
-    overlap=dict(n_overlap=len(set(X.columns)&set(panel["feats"])),n_total=len(panel["feats"]),
-                 panel_name=panel["name"],coverage=len(set(X.columns)&set(panel["feats"])) / max(1,len(panel["feats"])))
-    return summary,pd.DataFrame(proba,columns=panel["classes"],index=X.index),panel["name"],overlap
+        s5 = {c.upper() for c in feat5}
+        s6 = {c.upper() for c in feat6}
+        cset = set(cols_up)
+    ov5 = len(cset & s5)
+    ov6 = len(cset & s6)
+    if ov5 == 0 and ov6 == 0:
+        return None, {"ov5": ov5, "ov6": ov6}
+    panel = "5k" if ov5 >= ov6 else "60k"
+    return panel, {"ov5": ov5, "ov6": ov6, "n_total": len(cols)}
 
-# ---------- Demo ----------
-DEMO_PATH = ROOT / "data" / "processed" / "demo_60k_ensembl.csv"
-@st.cache_data
-def load_demo_df():
-    return pd.read_csv(DEMO_PATH, index_col=0) if DEMO_PATH.exists() else None
-demo_df = load_demo_df()
+def map_to_panel_header(df_in: pd.DataFrame, panel: str, feat5, feat6, idmaps):
+    """Return (df_aligned, coverage_dict, used_ids_note) aligned to model features.
+       Accepts symbols or Ensembl in header; maps as needed; fills missing with 0.0."""
+    feats = feat5 if panel == "5k" else feat6
+    cols = list(df_in.columns)
+    cols_up = _to_upper(cols)
 
-# ---------- Tabs ----------
-tab1,tab2,tab3 = st.tabs(["📤 Upload CSV","🧾 Paste from Excel","🧪 Try demo dataset (60k)"])
+    # Detect if Ensembl-like
+    has_ens = sum(1 for c in cols_up if c.startswith("ENSG")) > 0
+    if has_ens:
+        # work with stripped Ensembl
+        col_map = {c: strip_ver(c).upper() for c in cols}
+        df = df_in.copy()
+        df.columns = [col_map[c] for c in cols]
+        # target features: stripped Ensembl
+        tgt = [strip_ver(f).upper() for f in feats]
+        df = df.reindex(columns=tgt).fillna(0.0)
+        coverage = (df.columns.notna().sum(), len(tgt))
+        return df, {"n_overlap": int((df.columns != "").sum()), "n_total": len(tgt),
+                    "coverage": sum(df.columns == df.columns)/len(tgt)}, "ensembl"
+    else:
+        # columns look like symbols → try map to Ensembl for 60k (or keep as symbols for 5k if feats are symbols)
+        df = df_in.copy()
+        if panel == "5k":
+            # the 5k list may be Ensembl or symbols depending on your training; handle both
+            if any(str(f).upper().startswith("ENSG") for f in feats):
+                # 5k feats are Ensembl → map symbols→Ensembl
+                if idmaps is None:
+                    raise ValueError("ID map not found; cannot map symbols to Ensembl (5k).")
+                sym_up = [c.upper() for c in df.columns]
+                ens = [idmaps["symbol_to_ensg"].get(s) for s in sym_up]
+                df.columns = ens
+                tgt = [strip_ver(f).upper() for f in feats]
+                df = df.reindex(columns=tgt).fillna(0.0)
+            else:
+                # 5k feats are symbols
+                tgt = [str(f).upper() for f in feats]
+                df.columns = [c.upper() for c in df.columns]
+                df = df.reindex(columns=tgt).fillna(0.0)
+        else:
+            # 60k panel uses Ensembl
+            if idmaps is None:
+                raise ValueError("ID map not found; cannot map symbols to Ensembl (60k).")
+            sym_up = [c.upper() for c in df.columns]
+            ens = [idmaps["symbol_to_ensg"].get(s) for s in sym_up]
+            df.columns = ens
+            tgt = [strip_ver(f).upper() for f in feats]
+            df = df.reindex(columns=tgt).fillna(0.0)
+        # Compute overlap
+        used = df.columns.notna().sum()
+        cov = used / len(df.columns) if len(df.columns) else 0.0
+        return df, {"n_overlap": int(used), "n_total": int(len(df.columns)), "coverage": float(cov)}, "symbols"
 
-# Upload
-with tab1:
-    up=st.file_uploader("Choose a CSV file",type=["csv"])
+def build_df_from_header(lines):
+    header = split_line(lines[0])
+    if looks_numeric_list(header):
+        raise ValueError("The first line is numeric. For values-only mode, omit the header entirely.")
+    rows = []
+    for i, line in enumerate(lines[1:], start=2):
+        toks = split_line(line)
+        if not toks:
+            continue
+        if not looks_numeric_list(toks):
+            raise ValueError(f"Line {i} contains non-numeric values.")
+        rows.append([float(x) for x in toks])
+    if not rows:
+        raise ValueError("Provide at least one numeric row after the header.")
+    ncols = len(header)
+    if any(len(r) != ncols for r in rows):
+        raise ValueError("All rows must have the same number of values as the header.")
+    # No patient/ID columns
+    bad = [c for c in header if str(c).lower() in {"sample", "id", "patient", "patient_id"}]
+    if bad:
+        raise ValueError(f"Remove non-gene columns: {bad}")
+    return pd.DataFrame(rows, columns=header, index=[f"sample_{i+1}" for i in range(len(rows))])
+
+def build_df_values_only(lines, feat5, feat6):
+    rows = []
+    for i, line in enumerate(lines, start=1):
+        toks = split_line(line)
+        if not toks:
+            continue
+        if not looks_numeric_list(toks):
+            raise ValueError(f"Line {i} is not numeric.")
+        rows.append([float(x) for x in toks])
+    if not rows:
+        raise ValueError("No numeric rows found.")
+    widths = {len(r) for r in rows}
+    if len(widths) != 1:
+        raise ValueError("All rows must contain the same number of values.")
+    w = widths.pop()
+    if w == len(feat6):
+        panel, feats = "60k", feat6
+    elif w == len(feat5):
+        panel, feats = "5k", feat5
+    else:
+        raise ValueError(
+            f"Values-only mode requires width exactly {len(feat5)} (5k) or {len(feat6)} (60k). Got {w}."
+        )
+    df = pd.DataFrame(rows, columns=feats, index=[f"sample_{i+1}" for i in range(len(rows))])
+    return panel, df
+
+def guard_against_flat(df: pd.DataFrame):
+    # If the input collapses to many zeros or near-const, scikit can output near-uniform probabilities.
+    if (df.std(axis=0) == 0).mean() > 0.10:
+        st.warning(
+            "⚠️ Many features are constant or zero after alignment. "
+            "This can degrade confidence. Consider supplying more genes / the proper panel."
+        )
+    if (df.abs().sum(axis=1) == 0).any():
+        st.warning(
+            "⚠️ Some samples contain all zeros after alignment (no overlapping genes). "
+            "Those will produce near-uniform probabilities."
+        )
+
+def run_predict(df_aligned: pd.DataFrame, panel: str):
+    """Assumes df_aligned columns are exactly the model's training features & order.
+       All preprocessing should be inside the saved pipeline."""
+    model = load_model(panel)
+    # Ensure order = features in the pipeline (if available)
+    # Many sklearn pipelines with ColumnTransformer can accept DataFrames by name.
+    # If model expects numpy, we still pass df_aligned.values.
+    try:
+        probs = model.predict_proba(df_aligned)
+    except Exception:
+        probs = model.predict_proba(df_aligned.values)
+
+    classes = getattr(model, "classes_", ["Basal", "Her2", "LumA", "LumB", "Normal"])
+    probs_df = pd.DataFrame(probs, index=df_aligned.index, columns=classes)
+
+    top = probs_df.idxmax(axis=1)
+    maxp = probs_df.max(axis=1)
+    # Margin between top2
+    sorted2 = np.sort(probs, axis=1)[:, -2:]
+    margin = sorted2[:, 1] - sorted2[:, 0]
+    # Entropy (bits)
+    ent = (-probs * np.log2(np.clip(probs, 1e-12, 1))).sum(axis=1)
+
+    summary = pd.DataFrame({
+        "predicted_subtype": top.values,
+        "second_best": probs_df.apply(lambda r: r.drop(r.idxmax()).idxmax(), axis=1).values,
+        "top2_margin": np.round(margin, 5),
+        "max_prob": np.round(maxp, 5),
+        "entropy_bits": np.round(ent, 4),
+        "confident_call": (maxp >= 0.8).values
+    }, index=df_aligned.index)
+
+    # Flag obviously flat outputs
+    if np.allclose(probs.std(axis=0), 0, atol=1e-6):
+        st.warning(
+            "⚠️ Model returned near-uniform probabilities across classes. "
+            "This usually indicates too little overlap or the wrong panel/order."
+        )
+    return summary, probs_df
+
+def validate_and_align(df_header_mode: pd.DataFrame | None,
+                       values_lines: list[str] | None,
+                       feat5, feat6, idmaps):
+    """Returns (panel, df_aligned, overlap_info, header_mode)"""
+    if df_header_mode is not None:
+        panel, ov = detect_panel_from_header(df_header_mode.columns.tolist(), feat5, feat6)
+        if panel is None:
+            raise ValueError("Could not match genes to either panel (5k/60k).")
+        df_aligned, cov, _src = map_to_panel_header(df_header_mode, panel, feat5, feat6, idmaps)
+        cov.update(ov)
+        return panel, df_aligned, cov, True
+    else:
+        panel, df_aligned = build_df_values_only(values_lines, feat5, feat6)
+        return panel, df_aligned, {"n_overlap": df_aligned.shape[1],
+                                   "n_total": df_aligned.shape[1],
+                                   "coverage": 1.0}, False
+
+# ============== UI: Tabs ==============
+t1, t2, t3 = st.tabs(["📂 Upload CSV", "📋 Paste from Excel", "🧪 Try demo dataset"])
+
+feat5 = load_features("5k")
+feat6 = load_features("60k")
+idmaps = load_id_map()
+
+# -------- Tab 1: Upload CSV --------
+with t1:
+    st.caption("Columns = gene IDs (HGNC symbols or Ensembl). Rows = samples.")
+    up = st.file_uploader("Choose a CSV file", type=["csv"])
     if up is not None:
-        raw=pd.read_csv(up)
-        st.write("Preview:",raw.iloc[:5,:10])
-        if st.button("🔮 Predict (uploaded)"):
-            try:
-                summary,proba_df,used_panel,overlap=run_predict(raw)
-                st.success(f"Used panel: **{used_panel}**")
-                st.info(f"Overlap: {overlap['n_overlap']}/{overlap['n_total']} ({overlap['coverage']:.1%})")
-                st.subheader("Results"); st.dataframe(summary,use_container_width=True)
-                with st.expander("Class probabilities"): st.dataframe(proba_df,use_container_width=True)
-            except Exception as e: st.error(f"Prediction error: {e}")
+        try:
+            df0 = pd.read_csv(up)
+            # If first column looks like an index/name, set it as index
+            if df0.columns[0].lower() in {"", "index", "sample", "samples"}:
+                df0 = df0.set_index(df0.columns[0])
+            # Ensure header mode (must be gene names)
+            if looks_numeric_list([str(c) for c in df0.columns.tolist()]):
+                raise ValueError("This file has numeric column names. "
+                                 "Upload files with gene IDs in the header, or use the paste box values-only mode.")
+            panel, dfX, ov, header_mode = validate_and_align(df0, None, feat5, feat6, idmaps)
+            st.success(f"Detected panel: **{panel}** • Overlap {ov.get('ov5','')}/{ov.get('n_total','')} (5k), "
+                       f"{ov.get('ov6','')}/{ov.get('n_total','')} (60k) — using **{panel}**")
+            guard_against_flat(dfX)
+            if st.button("🔮 Predict (from upload)"):
+                summary, probs = run_predict(dfX, panel)
+                st.subheader("Results")
+                st.dataframe(summary, use_container_width=True)
+                with st.expander("Class probabilities"):
+                    st.dataframe(probs, use_container_width=True)
+        except Exception as e:
+            st.error(f"{e}")
 
-# Paste (fixed)
-with tab2:
-    st.subheader("Paste data (header optional)")
-    st.caption("Tabs, commas, or spaces. First line may be genes or numeric values.")
-    txt = st.text_area("Paste here", height=220,
-                       placeholder="CLEC3A,HOXB13,S100A7,...\n1.23,0.45,2.10,...\n0.98,1.22,0.00,...")
+# -------- Tab 2: Paste from Excel --------
+with t2:
+    st.caption("First line may be a **header** (gene IDs), followed by one or more numeric rows. "
+               "Or paste **values-only** (no header) — width must be exactly 5k or 60k.")
 
-    def _split_line(line:str): return [t for t in re.split(r"[,\t ]+", line.strip()) if t]
-    def _mostly_numbers(tokens): 
-        try: [float(t) for t in tokens]; return True
-        except: return False
+    example_vals = (
+        "-1.278476675 -1.140010165 -0.745154728 -1.322989053 -1.091007512\n"
+        "-0.878611061  1.297804034 -0.028383165 -1.007149765  0.413104676\n"
+        " 1.372123455 -1.330842211 -1.075536606  1.410640221 -1.01801127"
+    )
+    txt = st.text_area(
+        "Paste here",
+        height=220,
+        placeholder="CLEC3A\tHOXB13\tS100A7\tSERPINA6\t...\n0.42\t-1.23\t0.09\t-0.55\t...\n\n"
+                    "— or values-only (no header) —\n" + example_vals
+    )
 
     if st.button("🔮 Predict (from paste)"):
         try:
-            lines=[l for l in txt.splitlines() if l.strip()]
-            if not lines: raise ValueError("Paste at least one non-empty line.")
-            first=_split_line(lines[0]); has_header=not _mostly_numbers(first)
-            if has_header: genes=first; value_lines=lines[1:]
-            else: genes=None; value_lines=lines
-            if not value_lines: raise ValueError("No value rows found.")
-            data=[[float(x) for x in _split_line(r)] for r in value_lines]
-            width=len(data[0])
-            if genes is None: genes=[f"g{i+1}" for i in range(width)]
-            df_user=pd.DataFrame(data,columns=genes,index=[f"sample_{i+1}" for i in range(len(data))])
-            summary,proba_df,used_panel,overlap=run_predict(df_user)
-            st.success(f"Used panel: **{used_panel}**")
-            st.info(f"Overlap: {overlap['n_overlap']}/{overlap['n_total']} ({overlap['coverage']:.1%})")
-            st.subheader("Results"); st.dataframe(summary,use_container_width=True)
-            with st.expander("Class probabilities"): st.dataframe(proba_df,use_container_width=True)
-        except Exception as e: st.error(f"Paste error: {e}")
+            lines = [l for l in txt.splitlines() if l.strip()]
+            if not lines:
+                raise ValueError("Nothing to parse.")
+            first_tokens = split_line(lines[0])
+            header_mode = not looks_numeric_list(first_tokens)
+            df_header = build_df_from_header(lines) if header_mode else None
+            panel, dfX, ov, header_mode = validate_and_align(df_header,
+                                                             None if header_mode else lines,
+                                                             feat5, feat6, idmaps)
+            if header_mode:
+                st.success(f"Header mode ✓ • Selected: **{panel}** • Overlap: "
+                           f"{ov.get('ov5','?')}/{ov.get('n_total','?')} (5k), "
+                           f"{ov.get('ov6','?')}/{ov.get('n_total','?')} (60k)")
+            else:
+                st.success(f"Values-only mode ✓ • Width matches **{panel}** panel.")
+            guard_against_flat(dfX)
+            summary, probs = run_predict(dfX, panel)
+            st.subheader("Results")
+            st.dataframe(summary, use_container_width=True)
+            with st.expander("Class probabilities"):
+                st.dataframe(probs, use_container_width=True)
+        except Exception as e:
+            st.error(f"{e}")
 
-# Demo
-with tab3:
-    if demo_df is not None:
-        st.write("Preview (first 25 genes):"); st.dataframe(demo_df.iloc[:,:25],use_container_width=True)
-        st.download_button("⬇️ Download demo (60k, Ensembl IDs)", data=demo_df.to_csv().encode(),
-                           file_name="demo_60k_ensembl.csv", mime="text/csv", use_container_width=True)
-        if st.button("🔮 Predict demo (60k)"):
-            try:
-                summary,proba_df,used_panel,overlap=run_predict(demo_df,force_panel_name="60k_panel_legacy")
-                st.success(f"Used panel: **{used_panel}**")
-                st.info(f"Overlap: {overlap['n_overlap']}/{overlap['n_total']} ({overlap['coverage']:.1%})")
-                st.subheader("Results"); st.dataframe(summary,use_container_width=True)
-                with st.expander("Class probabilities"): st.dataframe(proba_df,use_container_width=True)
-            except Exception as e: st.error(f"Prediction error (demo): {e}")
-    else: st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py`.")
+# -------- Tab 3: Demo (cached, instant) --------
+with t3:
+    st.caption("Small TCGA-BRCA subset. 60k demo uses Ensembl IDs; 5k uses symbols.")
+    c1, c2, c3 = st.columns([1,1,2])
+    with c1:
+        use_panel = st.selectbox("Demo panel", ["60k", "5k"], index=0)
+    df_demo = load_demo(use_panel)
+    if df_demo is None:
+        st.warning("Demo file not found in repo.")
+    else:
+        st.dataframe(df_demo.head(), use_container_width=True)
+        # Preview link / download
+        csv_bytes = df_demo.to_csv().encode("utf-8")
+        st.download_button("⬇️ Download demo CSV", data=csv_bytes,
+                           file_name=f"demo_{use_panel}.csv", mime="text/csv")
+        if st.button("🔮 Predict demo now"):
+            # Demo is already aligned to the right header; still reindex to ensure order
+            feats = feat6 if use_panel == "60k" else feat5
+            cols_target = [strip_ver(c).upper() if str(c).upper().startswith("ENSG") else str(c)
+                           for c in feats]
+            X = df_demo.copy()
+            # Best-effort normalize headers to match target list
+            if any(str(c).upper().startswith("ENSG") for c in X.columns):
+                X.columns = [strip_ver(c).upper() for c in X.columns]
+                cols_target = [strip_ver(c).upper() for c in feats]
+            else:
+                X.columns = [str(c).upper() for c in X.columns]
+                cols_target = [str(c).upper() for c in feats]
+            X = X.reindex(columns=cols_target).fillna(0.0)
+            guard_against_flat(X)
+            summary, probs = run_predict(X, use_panel)
+            st.subheader("Results")
+            st.dataframe(summary, use_container_width=True)
+            with st.expander("Class probabilities"):
+                st.dataframe(probs, use_container_width=True)
 
-st.caption("© 2025 BRCATranstypia — 5k/60k auto-detect • robust paste • demo • PDF link + inline • 60k z-score normalization")
+# Footer
+st.markdown(
+    "<hr/>"
+    "<div style='font-size:0.9rem;opacity:0.8;'>© 2025 BRCATranstypia • Multi-panel auto-detect "
+    "• robust paste • instant demo • "
+    f"<a href='{GUIDE_URL}' target='_blank'>User Guidelines</a></div>",
+    unsafe_allow_html=True
+)
