@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia (Multi-panel + symbol→Ensembl mapping + clinical gating + sidebar help + DEMO 60k + overlap report)
+# app.py — BRCATranstypia (Multi-panel + symbol→Ensembl mapping + clinical gating + DEMO 60k fast preview + inline guidelines link)
 
 from pathlib import Path
 import io, re
@@ -10,7 +10,7 @@ import joblib
 # ------------------------- PAGE CONFIG -------------------------
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
 
-# ------------------------- TITLE + TOP ACTIONS -------------------------
+# ------------------------- TITLE + HERO -------------------------
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 
 # Link to a hosted PDF on GitHub (edit if you use a different filename/path)
@@ -18,22 +18,30 @@ GUIDE_URL = "https://raw.githubusercontent.com/layanomics/BRCATranstypia/main/we
 # If you also ship the PDF with the app, enable a download button:
 LOCAL_GUIDE = Path(__file__).resolve().parent / "static" / "User_Guidelines.pdf"
 
-col_top_a, col_top_b = st.columns([1,1])
-with col_top_a:
-    st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
-with col_top_b:
+# Hero tip
+st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
+
+# >>> CHANGE #2: put the guidelines link/button **right under** the hero tip
+guide_cols = st.columns([1, 4])
+with guide_cols[0]:
+    st.markdown("**📘 User Guidelines**")
+with guide_cols[1]:
     if LOCAL_GUIDE.exists():
         with open(LOCAL_GUIDE, "rb") as fh:
-            st.download_button("📄 Download Full User Guidelines (PDF)", data=fh.read(),
-                               file_name="User_Guidelines.pdf", mime="application/pdf", use_container_width=True)
-    st.markdown(f"[📖 Open Full User Guidelines](#{GUIDE_URL})", help="Opens the PDF in your browser")
+            st.download_button("Open / Download PDF",
+                               data=fh.read(),
+                               file_name="User_Guidelines.pdf",
+                               mime="application/pdf",
+                               use_container_width=False)
+    else:
+        st.markdown(f"[Open / Download PDF]({GUIDE_URL})")
 
 # ====== Clinical-style reporting thresholds ======
 CONF_THRESH    = 0.85
 MARGIN_THRESH  = 0.15
 ENTROPY_THRESH = 1.40
 
-# ------------------------- SIDEBAR GUIDELINES -------------------------
+# ------------------------- SIDEBAR GUIDELINES (quick help) -------------------------
 with st.sidebar:
     st.markdown("### 🧭 User Guidelines (Quick)")
     st.info("""
@@ -186,14 +194,20 @@ def align_for_panel(X, panel):
     return X.reindex(columns=panel["feats"]).fillna(0.0)
 
 # ------------------------- DEMO DATASET (LEGACY 60k) -------------------------
-# Expect samples × genes (columns are Ensembl IDs), to best fit the 60k legacy panel
 DEMO_PATH = ROOT / "data" / "processed" / "demo_60k_ensembl.csv"
 
-@st.cache_resource
+# >>> CHANGE #1 (part A): cache the demo load
+@st.cache_data(show_spinner=False)
 def load_demo_df():
     if DEMO_PATH.exists():
         return pd.read_csv(DEMO_PATH, index_col=0)
     return None
+
+# Tiny, fast preview (avoid rendering 60k columns)
+def show_wide_preview(df, n_genes=25):
+    small = df.iloc[:, :n_genes].copy()
+    st.dataframe(small, use_container_width=True, height=260)
+    st.caption(f"Preview shows first **{n_genes}** genes out of **{df.shape[1]}** total.")
 
 def compute_overlap_stats(mapped_cols: set[str], panel_feats: list[str]):
     fset = set(panel_feats)
@@ -225,7 +239,6 @@ def run_predict(Xsym: pd.DataFrame):
         "entropy_bits": ent, "confident_call": conf_ok
     }, index=X.index)
 
-    # package overlap stats to show in UI
     overlap = dict(n_overlap=n_overlap, n_total=n_total, ratio=ratio, missing=missing, panel_name=panel["name"])
     return summary, pd.DataFrame(proba, columns=panel["classes"], index=X.index), panel["name"], overlap
 
@@ -280,7 +293,6 @@ with tab2:
             if has_header:
                 genes = [g for g in header if g]; value_lines = lines[1:]
             else:
-                # fallback: assume 5k order (still okay; we map and auto-pick best panel)
                 genes = PANELS[0]["feats"][: len(header)]; value_lines = lines
 
             values = []
@@ -305,10 +317,12 @@ with tab2:
 with tab3:
     st.subheader("Use a built-in demo dataset (Legacy 60k)")
     if demo_df is None:
-        st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k_legacy.py` and push `data/processed/demo_60k_ensembl.csv`.")
+        st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
     else:
         st.caption("Small TCGA-BRCA subset (Ensembl IDs; aligned to legacy 60k panel).")
-        st.dataframe(demo_df.head(), use_container_width=True)
+        # >>> CHANGE #1 (part B): tiny preview instead of rendering 60k columns
+        show_wide_preview(demo_df, n_genes=25)
+
         colA, colB = st.columns([1,1])
         with colA:
             if st.button("🔮 Predict on demo (60k)"):
@@ -324,4 +338,5 @@ with tab3:
                                file_name="demo_60k_ensembl.csv", mime="text/csv")
 
 st.caption("© 2025 BRCATranstypia | Quantile-calibrated SVM • Legacy 60k support • Multi-panel • Ensembl mapping • Clinical gating • Overlap reporting")
+
 
