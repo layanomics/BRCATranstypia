@@ -9,7 +9,37 @@ import joblib
 
 # ------------------------- PAGE CONFIG -------------------------
 st.set_page_config(page_title="BRCATranstypia", layout="wide")
+# ------------------------- SIDEBAR GUIDELINES -------------------------
+with st.sidebar:
+    st.markdown("### 🧭 User Guidelines for Clinical/Research Use")
+    st.info("""
+    **1️⃣ Input Format**  
+    • Rows = samples, columns = genes (symbols or Ensembl IDs).  
+    • Accepts `.csv` uploads or direct Excel-style paste.  
+
+    **2️⃣ Data Normalization**  
+    • Use TPM-like or normalized log-expression values.  
+    • Raw read counts are not recommended.  
+    • Quantile & z-score normalization are handled internally.
+
+    **3️⃣ Model Selection**  
+    • Auto-detects best gene panel (5k or 60k).  
+    • Includes symbol→Ensembl mapping for flexibility.
+
+    **4️⃣ Output Interpretation**  
+    • Subtypes: *LumA, LumB, Basal, Her2, Normal*.  
+    • Confidence gating thresholds:  
+      prob ≥ 0.85, margin ≥ 0.15, entropy ≤ 1.40.  
+    • Samples below these thresholds → *Indeterminate*.
+
+    **5️⃣ Disclaimer**  
+    ⚠️ For research and educational use only.  
+    Not for clinical diagnosis or treatment decisions.
+    """)
+# ------------------------- TITLE -------------------------
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
+st.info("💡 Upload or paste normalized gene expression data. The app will auto-detect the panel and predict molecular subtype.")
+
 
 # ====== Clinical-style reporting thresholds ======
 CONF_THRESH    = 0.85
@@ -234,34 +264,7 @@ with tab2:
         except Exception as e:
             st.exception(e)
 
-# ------------------------- USER GUIDELINES -------------------------
-with st.expander("📘 User Guidelines for Clinical/Research Use", expanded=False):
-    st.markdown("""
-    ### 🧬 Guidelines for Using the Transcriptomic Subtype Prediction Model
 
-    **1. Input format**
-    - Accepts tabular data with gene symbols or Ensembl IDs.  
-    - Rows represent **samples**, columns represent **gene expression values**.  
-    - Supports both **CSV upload** and **Excel-style paste**.
-
-    **2. Data normalization**
-    - Input should be *TPM-like* or *normalized log expression* (not raw counts).  
-    - The model internally applies quantile and z-normalization steps.
-
-    **3. Model selection**
-    - Automatically detects the most compatible gene panel (5k vs. 60k).  
-    - Uses symbol → Ensembl mapping for flexibility.
-
-    **4. Interpretation**
-    - Displays predicted subtypes: *LumA, LumB, Basal, Her2, Normal*.  
-    - Confidence gating thresholds are applied:  
-      `prob ≥ 0.85`, `margin ≥ 0.15`, `entropy ≤ 1.40`.  
-      Samples failing these are flagged as *Indeterminate*.
-
-    **5. Disclaimer**
-    - This tool is for research and educational purposes only.  
-    - Clinical decisions should rely on validated assays and expert review.
-    """)
 
 st.caption("© 2025 BRCATranstypia | Quantile-calibrated SVM • Multi-panel • Ensembl mapping • Clinical gating")
 
