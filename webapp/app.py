@@ -1,4 +1,4 @@
-# app.py — BRCATranstypia 
+# app.py — BRCATranstypia (inline PDF + true new-tab link, fixed Ensembl regex)
 
 from pathlib import Path
 import io, re
@@ -13,7 +13,7 @@ st.set_page_config(page_title="BRCATranstypia", layout="wide")
 st.title("🧬 BRCATranstypia — BRCA Subtype Predictor (Multi-panel)")
 st.info("💡 Upload or paste normalized gene expression data. The app auto-detects the panel and predicts the molecular subtype.")
 
-# --- Inline PDF (no GitHub) ---
+# --- Locate repo root and guide file ---
 def find_root(start: Path) -> Path:
     p = start.resolve()
     for _ in range(8):
@@ -26,12 +26,15 @@ THIS = Path(__file__).resolve()
 ROOT = find_root(THIS.parent)
 GUIDE_PATH = ROOT / "webapp" / "static" / "User_Guidelines.pdf"
 
-def show_user_guide_inline():
+# --- Inline PDF + true new-tab link (no GitHub/routes) ---
+def show_user_guide_inline_and_link():
     if not GUIDE_PATH.exists():
         st.warning("User guide PDF not found at `webapp/static/User_Guidelines.pdf`.")
         return
     pdf_bytes = GUIDE_PATH.read_bytes()
     b64 = b64encode(pdf_bytes).decode("utf-8")
+
+    # Inline viewer (collapsible)
     st.markdown(
         f"""
         <details>
@@ -45,13 +48,14 @@ def show_user_guide_inline():
         """,
         unsafe_allow_html=True,
     )
-    st.caption("Tip: right-click → “Open frame in new tab” for full screen.")
-show_user_guide_inline()
-st.markdown(
-    "[🌐 Open User Guidelines in new tab](/webapp/static/User_Guidelines.pdf)",
-    unsafe_allow_html=True
-)
+    # Real "open in a browser tab" link (data URI)
+    st.markdown(
+        f'<a href="data:application/pdf;base64,{b64}" target="_blank" rel="noopener noreferrer">🌐 Open User Guidelines in new tab</a>',
+        unsafe_allow_html=True,
+    )
+    st.caption("Tip: you can also right-click the inline frame → Open frame in new tab.")
 
+show_user_guide_inline_and_link()
 
 # ---- Confidence gate thresholds ----
 CONF_THRESH    = 0.85
@@ -80,7 +84,7 @@ def read_feats_file(p: Path) -> list[str]:
             seen.add(x); out.append(x)
     return out
 
-# ---------- PANELS: get exact features from model.feature_names_in_ ----------
+# ---------- PANELS ----------
 PANELS_RAW = [
     dict(
         name="5k_panel_svm",
@@ -138,7 +142,8 @@ def build_symbol_to_ensembl():
     return sym2ens
 
 SYM2ENS = build_symbol_to_ensembl()
-ENSEMBL_PAT = re.compile(r"ENSG\\d{9,}")
+# ✅ FIXED: single backslash (recognize real Ensembl IDs)
+ENSEMBL_PAT = re.compile(r"ENSG\d{9,}")
 
 def parse_any_table(upload) -> pd.DataFrame:
     df = pd.read_csv(io.BytesIO(upload.getvalue()))
@@ -274,7 +279,7 @@ def run_predict(Xsym: pd.DataFrame):
     return summary, pd.DataFrame(proba, columns=panel["classes"], index=X.index), panel["name"], overlap
 
 demo_df = load_demo_df()
-tab1, tab2, tab3 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel", "🧪 Try demo dataset"])
+tab1, tab2, tab3 = st.tabs(["📤 Upload CSV", "🧾 Paste from Excel", "🧪 Try demo dataset (60k)"])
 
 with tab1:
     st.subheader("Upload CSV (samples × genes)")
@@ -298,7 +303,7 @@ with tab1:
         except Exception as e:
             st.exception(e)
     if demo_df is not None:
-        st.download_button("⬇️ Download demo (legacy 60k dataset)", data=demo_df.to_csv().encode(),
+        st.download_button("⬇️ Download demo (legacy 60k subset)", data=demo_df.to_csv().encode(),
                            file_name="demo_60k_ensembl.csv", mime="text/csv")
 
 with tab2:
@@ -343,7 +348,7 @@ with tab2:
             st.exception(e)
 
 with tab3:
-    st.subheader("Use a built-in demo dataset (Legacy dataset)")
+    st.subheader("Use a built-in demo dataset (Legacy 60k)")
     if demo_df is None:
         st.warning("Demo file not found. Run `tools/make_demo_from_tcga60k.py` and push `data/processed/demo_60k_ensembl.csv`.")
     else:
@@ -353,7 +358,7 @@ with tab3:
         st.caption(f"Preview shows first **25** genes out of **{demo_df.shape[1]}** total.")
         colA, colB = st.columns([1,1])
         with colA:
-            if st.button("🔮 Predict on demo"):
+            if st.button("🔮 Predict on demo (60k)"):
                 try:
                     summary, proba_df, used_panel, overlap = run_predict(demo_df)
                     st.success(f"Used panel: **{used_panel}**")
@@ -365,7 +370,7 @@ with tab3:
                 except Exception as e:
                     st.exception(e)
         with colB:
-            st.download_button("⬇️ Download demo CSV ", data=demo_df.to_csv().encode(),
+            st.download_button("⬇️ Download demo CSV (60k)", data=demo_df.to_csv().encode(),
                                file_name="demo_60k_ensembl.csv", mime="text/csv")
 
-st.caption("© 2025 BRCATranstypia | Inline user guide • Jaccard auto-detect (base Ensembl) • legacy Dataset support • Ensembl mapping • Clinical gating")
+st.caption("© 2025 BRCATranstypia | Inline user guide • true new-tab link • Jaccard auto-detect (base Ensembl) • 60k legacy support • Ensembl mapping • Clinical gating")
