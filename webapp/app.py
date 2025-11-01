@@ -9,8 +9,7 @@ import pandas as pd
 import streamlit as st
 import requests
 import sys
-sys.path.append('C:/Projects/BRCATranstypia/src')  
-from utils import map_symbols_to_ensembl
+
 # ------------------------------------------------------------
 # Restrict thread over-usage (stability)
 os.environ.setdefault("OMP_NUM_THREADS", "1")
