@@ -1,0 +1,3 @@
+scenario,error
+5k/alignment,🛑 Missing 4044 of 5k features → wrong panel or wrong model.
+60k/alignment,⚠️ Missing 60660 of 60k features — likely wrong panel.

@@ -1,0 +1,76 @@
+{
+  "results": [
+    {
+      "C": 1.0,
+      "method": "isotonic",
+      "tcga_acc": 0.8455284552845529,
+      "tcga_f1": 0.8267968652037616,
+      "tcga_mean_conf": 0.8462728982886718,
+      "doctor_mean_conf": 0.8239787508643115
+    },
+    {
+      "C": 1.0,
+      "method": "sigmoid",
+      "tcga_acc": 0.8373983739837398,
+      "tcga_f1": 0.8156477984167226,
+      "tcga_mean_conf": 0.7978601542304061,
+      "doctor_mean_conf": 0.8072614119304025
+    },
+    {
+      "C": 2.0,
+      "method": "isotonic",
+      "tcga_acc": 0.8455284552845529,
+      "tcga_f1": 0.8267968652037616,
+      "tcga_mean_conf": 0.846269552545524,
+      "doctor_mean_conf": 0.8239652169728969
+    },
+    {
+      "C": 2.0,
+      "method": "sigmoid",
+      "tcga_acc": 0.8373983739837398,
+      "tcga_f1": 0.8156477984167226,
+      "tcga_mean_conf": 0.7978530275252372,
+      "doctor_mean_conf": 0.8072436868775211
+    },
+    {
+      "C": 3.0,
+      "method": "isotonic",
+      "tcga_acc": 0.8455284552845529,
+      "tcga_f1": 0.8267968652037616,
+      "tcga_mean_conf": 0.8462909881303445,
+      "doctor_mean_conf": 0.8240005830197977
+    },
+    {
+      "C": 3.0,
+      "method": "sigmoid",
+      "tcga_acc": 0.8373983739837398,
+      "tcga_f1": 0.8156477984167226,
+      "tcga_mean_conf": 0.7978506035641052,
+      "doctor_mean_conf": 0.8072377522276641
+    },
+    {
+      "C": 5.0,
+      "method": "isotonic",
+      "tcga_acc": 0.8455284552845529,
+      "tcga_f1": 0.8267968652037616,
+      "tcga_mean_conf": 0.8462902673101225,
+      "doctor_mean_conf": 0.8239977034650344
+    },
+    {
+      "C": 5.0,
+      "method": "sigmoid",
+      "tcga_acc": 0.8373983739837398,
+      "tcga_f1": 0.8156477984167226,
+      "tcga_mean_conf": 0.7978487075394627,
+      "doctor_mean_conf": 0.8072328289572837
+    }
+  ],
+  "best": {
+    "C": 3.0,
+    "method": "isotonic",
+    "tcga_acc": 0.8455284552845529,
+    "tcga_f1": 0.8267968652037616,
+    "tcga_mean_conf": 0.8462909881303445,
+    "doctor_mean_conf": 0.8240005830197977
+  }
+}
